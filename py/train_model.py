@@ -26,6 +26,7 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 import numpy as np
 import seaborn as sns
+from sklearn.inspection import permutation_importance
 
 from data_loader import get_snowpark_session, load_training_data
 import feature_engineering
@@ -100,6 +101,41 @@ def lift_chart_plot(plot_name: str, decile_df: pd.DataFrame, x_axis: str):
     plt.savefig(os.path.join(output_data_dir, f"lift_chart_{plot_name.replace(' ', '_')}.png"))
     plt.close(fig)
 
+def generate_and_plot_lift_chart(y_true, y_proba, title, horizon):
+    """ Helper to calculate deciles and call lift_chart_plot """
+    results = pd.DataFrame({'y_true': y_true, 'proba': y_proba})
+    # Filter out any NaNs in target if they exist
+    results = results.dropna(subset=['y_true'])
+    if len(results) == 0:
+        logger.warning(f"Skipping lift chart for {title}: No data.")
+        return
+
+    results['prob_rank'] = results['proba'].rank(method='first', ascending=True)
+    results['decile'] = pd.qcut(results['prob_rank'], 10, labels=False, duplicates='drop')
+    
+    decile_df = results.groupby('decile').agg(
+        COUNT=('y_true', 'size'),
+        DEFAULT_RATE=('y_true', 'mean'),
+        AVG_PROB=('proba', 'mean'),
+        MIN_PROB=('proba', 'min'),
+        MAX_PROB=('proba', 'max')
+    ).reset_index(drop=True)
+    
+    decile_df['TOTAL_EVENT_RATE'] = results['y_true'].mean()
+    decile_df['prob_range'] = decile_df.apply(lambda row: f"[{row['MIN_PROB']:.5f} - {row['MAX_PROB']:.5f}]", axis=1)
+    
+    lift_chart_plot(f"{title} - Horizon {horizon}", decile_df, "prob_range")
+
+def plot_importance(importance_df, title, filename, output_dir):
+    """ Helper to plot feature importance """
+    plt.figure(figsize=(10, 8))
+    sns.barplot(x='importance', y='feature', data=importance_df)
+    plt.title(title)
+    plt.yticks(fontsize=9)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, filename), bbox_inches='tight')
+    plt.close()
+
 def train_attrition_model(horizon="8M"):
     """
     End-to-end model training pipeline for a specific churn horizon.
@@ -146,17 +182,30 @@ def train_attrition_model(horizon="8M"):
     # We use ORG_URI to ensure all history of an entity goes to either train or test
     org_uri_series = df.loc[X.index, 'ORG_URI']
     
+    # 3. Group-level Train/Test Split (stratified by whether the org ever had attrition)
+    # We use ORG_URI to ensure all history of an entity goes to either train or test
+    org_uri_series = df.loc[X.index, 'ORG_URI']
+    
     # Group by ORG_URI and find if they ever had attrition (max target)
     org_df = pd.DataFrame({'ORG_URI': org_uri_series.values, 'TARGET': y}, index=X.index)
     org_attrition = org_df.groupby('ORG_URI')['TARGET'].max()
     
-    # Split the unique organizations with stratification
-    train_orgs, test_orgs = train_test_split(
-        org_attrition.index, 
-        test_size=0.2, 
-        random_state=42, 
-        stratify=org_attrition.values
-    )
+    # Attempt stratified split, fallback to simple random split of organizations if it fails
+    try:
+        train_orgs, test_orgs = train_test_split(
+            org_attrition.index, 
+            test_size=0.2, 
+            random_state=42, 
+            stratify=org_attrition.values
+        )
+    except ValueError as e:
+        logger.warning(f"Stratified split failed due to class imbalance: {e}. Falling back to simple group-level split.")
+        train_orgs, test_orgs = train_test_split(
+            org_attrition.index, 
+            test_size=0.2, 
+            random_state=42, 
+            stratify=None
+        )
     
     # Create train and test masks for the rows
     train_mask = org_df['ORG_URI'].isin(train_orgs)
@@ -209,55 +258,59 @@ def train_attrition_model(horizon="8M"):
 
     logger.info("\n" + classification_report(y_test, y_pred))
     
-    # 6. Decile Analysis / Lift Chart
-    results = pd.DataFrame({'y_true': y_test, 'proba': y_proba})
-    results['prob_rank'] = results['proba'].rank(method='first', ascending=True)
-    results['decile'] = pd.qcut(results['prob_rank'], 10, labels=False)
-    
-    decile_df = results.groupby('decile').agg(
-        COUNT=('y_true', 'size'),
-        DEFAULT_RATE=('y_true', 'mean'),
-        AVG_PROB=('proba', 'mean'),
-        MIN_PROB=('proba', 'min'),
-        MAX_PROB=('proba', 'max')
-    ).reset_index(drop=True)
-    
-    decile_df['TOTAL_EVENT_RATE'] = results['y_true'].mean()
-    decile_df['prob_range'] = decile_df.apply(lambda row: f"[{row['MIN_PROB']:.5f} - {row['MAX_PROB']:.5f}]", axis=1)
-    
-    logger.info("Generating Lift Chart...")
-    lift_chart_plot(f"LightGBM Base Model Horizon {horizon}", decile_df, "prob_range")
-    
-    # 7. Save Artifacts
-    # SageMaker paths
-    model_dir = os.environ.get('SM_MODEL_DIR', 'attrition_pipeline/artifacts')
+    # 6. Decile Analysis / Lift Charts
+    logger.info("Generating Lift Charts...")
     output_data_dir = os.environ.get('SM_OUTPUT_DATA_DIR', 'attrition_pipeline/artifacts')
-    
-    os.makedirs(model_dir, exist_ok=True)
     os.makedirs(output_data_dir, exist_ok=True)
+
+    # 6.1 Global Lift Chart
+    generate_and_plot_lift_chart(y_test, y_proba, "Global Model", horizon)
+    
+    # 6.2 Segmented Lift Charts
+    if y_test_hard is not None:
+        generate_and_plot_lift_chart(y_test_hard, y_proba, "Hard Attrition Segment", horizon)
+    if y_test_silent is not None:
+        generate_and_plot_lift_chart(y_test_silent, y_proba, "Silent Attrition Segment", horizon)
+    
+    # 7. Save Model Artifacts
+    model_dir = os.environ.get('SM_MODEL_DIR', 'attrition_pipeline/artifacts')
+    os.makedirs(model_dir, exist_ok=True)
     
     with open(os.path.join(model_dir, "model.pkl"), "wb") as f:
         pickle.dump(model, f)
-        
     with open(os.path.join(model_dir, "feature_engineer.pkl"), "wb") as f:
         pickle.dump(fe, f)
-        
     logger.info(f"Saved model and feature engineer to {model_dir}")
     
-    # 8. Feature Importance Plot
+    # 8. Feature Importance Analysis
+    logger.info("Generating Feature Importance Plots...")
+    
+    # 8.1 Global Importance (Model Based)
     importance_df = pd.DataFrame({
         'feature': X.columns,
         'importance': model.feature_importances_
     }).sort_values(by='importance', ascending=False)
     
-    plt.figure(figsize=(10, 8))
-    sns.barplot(x='importance', y='feature', data=importance_df)
-    plt.title("Feature Importances - Baseline Model")
-    plt.yticks(fontsize=9)  # Reduce font size
-    plt.tight_layout()      # Automatically adjust subplots to give room for labels
-    plt.savefig(os.path.join(output_data_dir, "feature_importance.png"), bbox_inches='tight')
-    plt.close()
-    logger.info(f"Saved feature importance plot to {output_data_dir}")
+    plot_importance(importance_df, f"Global Feature Importance - {horizon}", "feature_importance_global.png", output_data_dir)
+    
+    # 8.2 Segmented Importance (Permutation Based)
+    # We use permutation importance to see what features drive the model for each specific segment
+    segments = [
+        ("Hard Attrition", y_test_hard, "feature_importance_hard.png"),
+        ("Silent Attrition", y_test_silent, "feature_importance_silent.png")
+    ]
+    
+    for segment_name, y_segment, filename in segments:
+        if y_segment is not None and len(np.unique(y_segment)) > 1:
+            logger.info(f"Calculating Permutation Importance for {segment_name}...")
+            r = permutation_importance(model, X_test, y_segment, n_repeats=5, random_state=42)
+            
+            seg_importance_df = pd.DataFrame({
+                'feature': X.columns,
+                'importance': r.importances_mean
+            }).sort_values(by='importance', ascending=False)
+            
+            plot_importance(seg_importance_df, f"Feature Importance: {segment_name} ({horizon})", filename, output_data_dir)
 
 if __name__ == "__main__":
     import argparse
