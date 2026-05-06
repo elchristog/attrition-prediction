@@ -142,17 +142,37 @@ def train_attrition_model(horizon="8M"):
     y_hard = df.loc[X.index, target_hard_col] if target_hard_col in df.columns else None
     y_silent = df.loc[X.index, target_silent_col] if target_silent_col in df.columns else None
     
-    # 3. Train/Test Split
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+    # 3. Group-level Train/Test Split (stratified by whether the org ever had attrition)
+    # We use ORG_URI to ensure all history of an entity goes to either train or test
+    org_uri_series = df.loc[X.index, 'ORG_URI']
     
-    # Split segmented targets using the same random state to maintain alignment
+    # Group by ORG_URI and find if they ever had attrition (max target)
+    org_df = pd.DataFrame({'ORG_URI': org_uri_series.values, 'TARGET': y}, index=X.index)
+    org_attrition = org_df.groupby('ORG_URI')['TARGET'].max()
+    
+    # Split the unique organizations with stratification
+    train_orgs, test_orgs = train_test_split(
+        org_attrition.index, 
+        test_size=0.2, 
+        random_state=42, 
+        stratify=org_attrition.values
+    )
+    
+    # Create train and test masks for the rows
+    train_mask = org_df['ORG_URI'].isin(train_orgs)
+    test_mask = org_df['ORG_URI'].isin(test_orgs)
+    
+    X_train, X_test = X[train_mask], X[test_mask]
+    y_train, y_test = y[train_mask.values], y[test_mask.values]
+    
+    # Mask segmented targets
     y_test_hard = None
     y_test_silent = None
     
     if y_hard is not None:
-        _, _, _, y_test_hard = train_test_split(X, y_hard, test_size=0.2, random_state=42, stratify=y)
+        y_test_hard = y_hard[test_mask]
     if y_silent is not None:
-        _, _, _, y_test_silent = train_test_split(X, y_silent, test_size=0.2, random_state=42, stratify=y)
+        y_test_silent = y_silent[test_mask]
     
     # 4. Model Training
     logger.info("Training LightGBM model...")
