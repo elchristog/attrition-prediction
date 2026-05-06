@@ -1,0 +1,356 @@
+CREATE OR REPLACE TABLE WORKSPACE.digitalda_stage.entity_Christian_target_variable as   -- option-A output only
+-- CREATE OR REPLACE TABLE WORKSPACE.digitalda_stage.entity_Acct_map_Christian as   -- option-C output only
+WITH 
+-- ============================================================================
+-- BLOCK 0: THE TIME SPINE & POINT-IN-TIME BRIDGE (SCD TYPE 2)
+-- ============================================================================
+-- 1. Generate 37 months (24 for reporting + 12 warm-up months for lags/history)
+CALENDAR AS (
+    SELECT LAST_DAY(ADD_MONTHS(DATE_TRUNC('month', CURRENT_DATE()), -SEQ4())) AS OBS_DATE
+    FROM TABLE(GENERATOR(ROWCOUNT => 37)) 
+),
+
+-- 2. THE HISTORICAL BRIDGE (With Infinite Retroactivity Patch)
+-- This logic solves the "Day Zero" issue where Reltio history only starts in Oct 2024.
+HISTORICAL_BRIDGE AS (
+    SELECT 
+        c.OBS_DATE,
+        snap.ACCOUNT_URI,
+        snap.ORGANIZATION_URI AS ORG_URI
+    FROM CALENDAR c
+    JOIN PREP.MDM_RELTIO.f_entity_wxaccountnumber_organization_snapshot snap
+        ON 
+        (
+            -- Standard SCD2 Condition: Observation falls within the record's validity window
+            c.OBS_DATE >= snap.ROW_EFF_BEGIN_DTTM 
+            AND (c.OBS_DATE < snap.ROW_EFF_END_DTTM OR snap.ROW_EFF_END_DTTM IS NULL)
+        )
+        OR 
+        (
+            -- INFINITE PATCH: If observation date is BEFORE Reltio's inception (Oct 2024),
+            -- we assume the account belonged to the earliest known Entity in the snapshot.
+            c.OBS_DATE < snap.ROW_EFF_BEGIN_DTTM
+            AND snap.ROW_EFF_BEGIN_DTTM = (
+                SELECT MIN(s2.ROW_EFF_BEGIN_DTTM) 
+                FROM PREP.MDM_RELTIO.f_entity_wxaccountnumber_organization_snapshot s2 
+                WHERE s2.ACCOUNT_URI = snap.ACCOUNT_URI
+            )
+        )
+),
+
+-- ============================================================================
+-- BLOCK 1: STATIC ACCOUNT DIMENSION (Data Cleaning)
+-- ============================================================================
+LATEST_NAA AS (
+    SELECT 
+        SOURCE_ACCOUNT_ID, 
+        ATTRITION_TYPE,
+        -- Clean 9999-12-31 dummy dates to avoid breaking time calculations
+        CASE 
+            WHEN ACCOUNT_CLOSED_DATE >= '3000-01-01'::DATE THEN NULL 
+            ELSE ACCOUNT_CLOSED_DATE 
+        END AS ACCOUNT_CLOSED_DATE
+    FROM FINANCE_ANALYTICS.NAM_PORTFOLIO_METRICS.NAM_ACCOUNT_ATTRITION
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY SOURCE_ACCOUNT_ID ORDER BY VOLUME_MONTH DESC) = 1
+),
+
+-- ============================================================================
+-- BLOCK 2: HISTORICAL RISK (AR Past Performance)
+-- ============================================================================
+AR_ALL_HISTORICAL AS (
+    SELECT CUST_ID, BUSINESS_DATE, WX_DAYS_PAST_DUE, WX_AGE99, WX_EIPP_BALANCE, WX_RCRSE_CODE, CR_LIMIT
+    FROM PREP.FIN__SYSADM.PS_WX_CUST_DAILY
+    UNION ALL
+    SELECT CUST_ID, BUSINESS_DATE, WX_DAYS_PAST_DUE, WX_AGE99, WX_EIPP_BALANCE, WX_RCRSE_CODE, CR_LIMIT
+    FROM PREP.FIN__SYSADM_ARCH.PS_WX_CSTDAY_ARCH
+    UNION ALL
+    SELECT CUST_ID, BUSINESS_DATE, WX_DAYS_PAST_DUE, WX_AGE99, WX_EIPP_BALANCE, WX_RCRSE_CODE, CR_LIMIT
+    FROM PREP.FIN__SYSADM_ARCH.PS_WX_CUST_DAILY_ARCH
+),
+AR_LATEST_DAY_PER_MONTH AS (
+    SELECT 
+        CUST_ID, 
+        DATE_TRUNC('month', BUSINESS_DATE) AS VOL_MONTH,
+        WX_DAYS_PAST_DUE, WX_AGE99, WX_EIPP_BALANCE, WX_RCRSE_CODE, CR_LIMIT
+    FROM AR_ALL_HISTORICAL
+    QUALIFY RANK() OVER (PARTITION BY CUST_ID, DATE_TRUNC('month', BUSINESS_DATE) ORDER BY BUSINESS_DATE DESC) = 1
+),
+AR_MONTHLY_CONSOLIDATED AS (
+    SELECT 
+        CUST_ID, 
+        VOL_MONTH,
+        MAX(CR_LIMIT) AS CR_LIMIT, 
+        MAX(WX_DAYS_PAST_DUE) AS WX_DAYS_PAST_DUE,
+        SUM(COALESCE(WX_AGE99, 0) + COALESCE(WX_EIPP_BALANCE, 0)) AS TOTAL_EXPOSURE,
+        -- Identify Fraud/Bankruptcy codes for exclusion
+        MAX(CASE WHEN WX_RCRSE_CODE IN ('82','92', 'LI', 'LB') THEN 1 ELSE 0 END) AS HAS_FRAUD_BANKRUPTCY
+    FROM AR_LATEST_DAY_PER_MONTH
+    GROUP BY CUST_ID, VOL_MONTH
+),
+
+-- ============================================================================
+-- BLOCK 3: HISTORICAL MONTHLY JOIN (Aggregating Accounts to Entity per Month)
+-- ============================================================================
+MONTHLY_ACCT_DATA AS (
+    SELECT 
+        hb.ORG_URI,
+        hb.OBS_DATE,
+        wx.ACCOUNTNUMBER,
+        ln.ACCOUNT_CLOSED_DATE,
+        ln.ATTRITION_TYPE,
+        
+        COALESCE(naa.OUTSTANDING_CARD_COUNT, 0) AS OUTSTANDING_CARD_COUNT,
+        COALESCE(naa.ACTIVE_CARD_COUNT, 0) AS ACTIVE_CARD_COUNT,
+        COALESCE(naa.PURCHASE_GALLONS_QTY, 0) AS PURCHASE_GALLONS_QTY,
+        COALESCE(naa.WEX_TRANSACTION_COUNT, 0) AS WEX_TRANSACTION_COUNT,
+        COALESCE(naa.ACCOUNT_TENURE_MONTHS, 0) AS ACCOUNT_TENURE_MONTHS,
+        COALESCE(ar.CR_LIMIT, 0) AS CR_LIMIT,
+        
+        -- Business Risk Logic: DPD > 60 with exposure or specific Fraud codes
+        CASE 
+            WHEN ar.HAS_FRAUD_BANKRUPTCY = 1 THEN 1 
+            WHEN ar.TOTAL_EXPOSURE > 175 AND ar.WX_DAYS_PAST_DUE >= 60 THEN 1 
+            ELSE 0 
+        END AS HAS_CREDIT_RISK
+
+    FROM HISTORICAL_BRIDGE hb
+    JOIN PREP.MDM_RELTIO.ENTITY_WXACCOUNTNUMBER wx ON hb.ACCOUNT_URI = wx.URI
+    LEFT JOIN LATEST_NAA ln ON wx.ACCOUNTNUMBER = ln.SOURCE_ACCOUNT_ID
+    
+    LEFT JOIN FINANCE_ANALYTICS.NAM_PORTFOLIO_METRICS.NAM_ACCOUNT_ATTRITION naa 
+        ON wx.ACCOUNTNUMBER = naa.SOURCE_ACCOUNT_ID AND LAST_DAY(naa.VOLUME_MONTH) = hb.OBS_DATE
+        
+    LEFT JOIN AR_MONTHLY_CONSOLIDATED ar 
+        ON wx.ACCOUNTNUMBER = ar.CUST_ID AND DATE_TRUNC('month', hb.OBS_DATE) = ar.VOL_MONTH
+
+    WHERE (wx.SOURCEACCOUNTTYPE IS NULL OR wx.SOURCEACCOUNTTYPE IN ('Account', 'EFS Contract'))
+    AND (
+        (LENGTH(wx.ACCOUNTNUMBER) IN (10, 13) AND wx.ACCOUNTNUMBER NOT LIKE '%-%') 
+        OR (wx.ACCOUNTNUMBER LIKE '%-%') 
+    )
+),
+
+ENTITY_MONTHLY_VOL AS (
+    SELECT 
+        ORG_URI, 
+        OBS_DATE,
+        SUM(OUTSTANDING_CARD_COUNT) AS ENT_OUTSTANDING_CARDS,
+        SUM(ACTIVE_CARD_COUNT) AS ENT_ACTIVE_CARDS,
+        SUM(PURCHASE_GALLONS_QTY) AS ENT_GALLONS,
+        SUM(WEX_TRANSACTION_COUNT) AS ENT_TXNS,
+        MAX(ACCOUNT_TENURE_MONTHS) AS ENT_MAX_ACTIVE_MONTHS,
+        SUM(CR_LIMIT) AS ENT_CREDIT_LIMIT,
+        
+        COUNT(DISTINCT ACCOUNTNUMBER) AS ACCOUNT_COUNT,
+        
+        COUNT(DISTINCT CASE 
+            WHEN ACCOUNT_CLOSED_DATE IS NULL OR ACCOUNT_CLOSED_DATE > OBS_DATE THEN ACCOUNTNUMBER 
+        END) AS ACTIVE_COUNT,
+        
+        MAX(CASE WHEN ACCOUNT_CLOSED_DATE <= OBS_DATE THEN ACCOUNT_CLOSED_DATE END) AS ORG_MAX_CLOSED_DATE_AS_OF_OBS,
+        
+        MAX(HAS_CREDIT_RISK) AS HAS_CURRENT_CREDIT_RISK,
+        MAX(CASE WHEN ACCOUNT_CLOSED_DATE >= DATEADD('day', -120, OBS_DATE) AND ACCOUNT_CLOSED_DATE <= OBS_DATE AND ATTRITION_TYPE = 'Involuntary' THEN 1 ELSE 0 END) AS HAS_INVOLUNTARY_CLOSE_120D,
+        MAX(CASE WHEN ACCOUNT_CLOSED_DATE >= DATEADD('day', -120, OBS_DATE) AND ACCOUNT_CLOSED_DATE <= OBS_DATE AND ATTRITION_TYPE = 'Conversion' THEN 1 ELSE 0 END) AS HAS_KNOWN_CONVERSION_120D
+
+    FROM MONTHLY_ACCT_DATA
+    GROUP BY 1, 2 
+),
+
+-- ============================================================================
+-- BLOCK 4: THE TIME MACHINE (Historical Trend Safeguards)
+-- ============================================================================
+ENTITY_TIME_TRAVEL AS (
+    SELECT 
+        *,
+        -- SAFETY: Count consecutive MDM months to ensure data maturity
+        COUNT(OBS_DATE) OVER (
+            PARTITION BY ORG_URI 
+            ORDER BY OBS_DATE 
+            ROWS BETWEEN 5 PRECEDING AND CURRENT ROW
+        ) AS MDM_HISTORY_MONTHS_AVAILABLE,
+
+        -- SAFETY: Track highest tenure to prevent dormant accounts from appearing as "New"
+        MAX(ENT_MAX_ACTIVE_MONTHS) OVER (
+            PARTITION BY ORG_URI 
+            ORDER BY OBS_DATE 
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS REAL_MAX_TENURE,
+
+        -- Historical Volume Lags (L1 to L5)
+        COALESCE(LAG(ENT_GALLONS, 1) OVER (PARTITION BY ORG_URI ORDER BY OBS_DATE), 0) AS GAL_L1,
+        COALESCE(LAG(ENT_GALLONS, 2) OVER (PARTITION BY ORG_URI ORDER BY OBS_DATE), 0) AS GAL_L2,
+        COALESCE(LAG(ENT_GALLONS, 3) OVER (PARTITION BY ORG_URI ORDER BY OBS_DATE), 0) AS GAL_L3,
+        COALESCE(LAG(ENT_GALLONS, 4) OVER (PARTITION BY ORG_URI ORDER BY OBS_DATE), 0) AS GAL_L4,
+        COALESCE(LAG(ENT_GALLONS, 5) OVER (PARTITION BY ORG_URI ORDER BY OBS_DATE), 0) AS GAL_L5,
+        
+        LAG(ENT_CREDIT_LIMIT, 1) IGNORE NULLS OVER (PARTITION BY ORG_URI ORDER BY OBS_DATE) AS CL_L1,
+        LAG(ENT_CREDIT_LIMIT, 3) IGNORE NULLS OVER (PARTITION BY ORG_URI ORDER BY OBS_DATE) AS CL_L3,
+        
+        -- Moving Average for drop-off detection
+        COALESCE(AVG(ENT_GALLONS) OVER (PARTITION BY ORG_URI ORDER BY OBS_DATE ROWS BETWEEN 3 PRECEDING AND 1 PRECEDING), 0) AS AVG_GAL_RECENT,
+        COALESCE(LAG(ENT_GALLONS, 12) OVER (PARTITION BY ORG_URI ORDER BY OBS_DATE), 0) AS GAL_L12
+    FROM ENTITY_MONTHLY_VOL
+),
+
+SILENT_ATTRITION_EVAL AS (
+    SELECT 
+        ORG_URI,
+        OBS_DATE,
+        
+        CASE 
+            -- WAIVER: We waive the 6-month MDM history requirement for years 2024 and prior 
+            -- to allow the Infinite Retroactivity patch to label the historical training set.
+            WHEN MDM_HISTORY_MONTHS_AVAILABLE < 6 AND OBS_DATE >= '2025-01-01'::DATE THEN 0
+            
+            -- WAIVER: Physical account must have existed for at least 6 months
+            WHEN COALESCE(REAL_MAX_TENURE, 0) < 6 THEN 0
+            
+            -- SILENT ATTRITION RULES
+            WHEN ENT_GALLONS = 0 AND GAL_L1 = 0 AND GAL_L2 = 0 AND GAL_L3 = 0 AND GAL_L4 = 0 AND GAL_L5 = 0 THEN 1
+            WHEN ENT_ACTIVE_CARDS <= 20 AND ENT_GALLONS = 0 AND GAL_L1 = 0 AND GAL_L2 = 0 AND GAL_L3 > 0  AND ENT_CREDIT_LIMIT <= COALESCE(CL_L3, 0) THEN 1
+            WHEN ENT_ACTIVE_CARDS >= 21 AND ENT_GALLONS = 0 AND GAL_L1 = 0 AND GAL_L2 = 0 AND GAL_L3 > 0 AND ENT_CREDIT_LIMIT <= COALESCE(CL_L3, 0) THEN 1
+            WHEN AVG_GAL_RECENT > 0 AND GAL_L12 > 0 AND ENT_GALLONS <= (AVG_GAL_RECENT * 0.50) AND ENT_GALLONS <= (GAL_L12 * 0.50) AND ENT_CREDIT_LIMIT <= COALESCE(CL_L1, 0) THEN 1
+            ELSE 0 
+        END AS IS_SILENT_ATTRITION
+    FROM ENTITY_TIME_TRAVEL
+),
+
+FINAL_MONTHLY_STATS AS (
+    SELECT 
+        t.*,
+        COALESCE(s.IS_SILENT_ATTRITION, 0) AS IS_SILENT_ATTRITION,
+        
+        -- Identify "Behavioral Flips": Sudden drop in accounts with closures but not classified as Risk or Silent
+        CASE 
+            WHEN t.ORG_MAX_CLOSED_DATE_AS_OF_OBS >= DATEADD('day', -120, t.OBS_DATE) 
+            AND t.ACTIVE_COUNT > 0
+            AND COALESCE(s.IS_SILENT_ATTRITION, 0) = 0
+            AND t.HAS_INVOLUNTARY_CLOSE_120D = 0
+            THEN 1 ELSE 0
+        END AS IS_BEHAVIORAL_FLIP
+        
+    FROM ENTITY_TIME_TRAVEL t
+    JOIN SILENT_ATTRITION_EVAL s ON t.ORG_URI = s.ORG_URI AND t.OBS_DATE = s.OBS_DATE
+),
+
+-- ============================================================================
+-- BLOCK 5: CLASSIFIED DATA (The Final Labeling Waterfall)
+-- ============================================================================
+CLASSIFIED_DATA AS (
+    SELECT 
+        ORG_URI,
+        OBS_DATE AS EVALUATION_MONTH,
+        ACCOUNT_COUNT,
+        ACTIVE_COUNT,
+        (ACCOUNT_COUNT - ACTIVE_COUNT) AS INACTIVE_ACCOUNT_COUNT,
+        ORG_MAX_CLOSED_DATE_AS_OF_OBS,
+        
+        CASE 
+            -- A. EXCLUSION: Risk and Conversions take absolute priority
+            WHEN HAS_KNOWN_CONVERSION_120D = 1 OR IS_BEHAVIORAL_FLIP = 1 THEN 'Event: Flip/Conversion'
+            WHEN HAS_CURRENT_CREDIT_RISK = 1 OR HAS_INVOLUNTARY_CLOSE_120D = 1 THEN 'Event: Risk/Involuntary'
+            
+            -- B. HARD CLOSE: If all accounts are physically closed
+            WHEN ACTIVE_COUNT = 0 THEN
+                CASE 
+                    WHEN ORG_MAX_CLOSED_DATE_AS_OF_OBS >= DATEADD('day', -30, OBS_DATE) THEN 'Event: Voluntary (Hard Close)'
+                    ELSE 'Inactive (Graveyard)' 
+                END
+
+            -- C. SILENT ATTRITION: Active but zero usage
+            WHEN IS_SILENT_ATTRITION = 1 THEN 'State: Voluntary (Silent)' 
+            
+            -- D. HEALTHY
+            WHEN ACTIVE_COUNT > 0 AND IS_SILENT_ATTRITION = 0 THEN 'Healthy' 
+            
+            -- E. ANOMALY
+            ELSE 'Data Anomaly / Ghosts' 
+        END AS HISTORICAL_ATTRITION_DECISION
+
+    FROM FINAL_MONTHLY_STATS
+)
+
+-- ============================================================================
+-- OUTPUT OPTIONS (Toggle as needed)
+-- ============================================================================
+
+-- OPTION A: GRANULAR OUTPUT (For ML training set generation)
+SELECT 
+    ORG_URI,
+    EVALUATION_MONTH,
+    ACCOUNT_COUNT,
+    ACTIVE_COUNT,
+    HISTORICAL_ATTRITION_DECISION,
+    
+    CASE 
+        WHEN HISTORICAL_ATTRITION_DECISION = 'Event: Flip/Conversion' THEN ORG_MAX_CLOSED_DATE_AS_OF_OBS 
+        ELSE NULL 
+    END AS FLIP_DATE,
+
+    CASE 
+        WHEN HISTORICAL_ATTRITION_DECISION = 'Event: Risk/Involuntary' THEN ORG_MAX_CLOSED_DATE_AS_OF_OBS
+        WHEN HISTORICAL_ATTRITION_DECISION = 'State: Voluntary (Silent)' THEN LAST_DAY(EVALUATION_MONTH)
+        WHEN HISTORICAL_ATTRITION_DECISION = 'Event: Voluntary (Hard Close)' THEN ORG_MAX_CLOSED_DATE_AS_OF_OBS
+        ELSE NULL 
+    END AS ATTRITION_DATE
+FROM CLASSIFIED_DATA
+WHERE  EVALUATION_MONTH < DATE_TRUNC('month', CURRENT_DATE()) 
+  -- AND EVALUATION_MONTH >= DATEADD('month', -24, CURRENT_DATE())
+ORDER BY ORG_URI, EVALUATION_MONTH DESC;
+
+
+/*
+-- OPTION B: AGGREGATED OUTPUT (For Portfolio Trends & Validation)
+SELECT 
+    EVALUATION_MONTH,
+    COUNT(DISTINCT ORG_URI) AS TOTAL_ENTITIES,
+    SUM(CASE WHEN HISTORICAL_ATTRITION_DECISION = 'Event: Voluntary (Hard Close)' THEN 1 ELSE 0 END) AS NEW_HARD_CLOSES,
+    SUM(CASE WHEN HISTORICAL_ATTRITION_DECISION = 'Event: Flip/Conversion' THEN 1 ELSE 0 END) AS NEW_FLIPS,
+    SUM(CASE WHEN HISTORICAL_ATTRITION_DECISION = 'Event: Risk/Involuntary' THEN 1 ELSE 0 END) AS NEW_RISK_CLOSES,
+    SUM(CASE WHEN HISTORICAL_ATTRITION_DECISION = 'State: Voluntary (Silent)' THEN 1 ELSE 0 END) AS CURRENT_SILENT,
+    SUM(CASE WHEN HISTORICAL_ATTRITION_DECISION = 'Inactive (Graveyard)' THEN 1 ELSE 0 END) AS GRAVEYARD,
+    SUM(CASE WHEN HISTORICAL_ATTRITION_DECISION = 'Healthy' THEN 1 ELSE 0 END) AS HEALTHY_ENTITIES,
+    SUM(CASE WHEN HISTORICAL_ATTRITION_DECISION = 'Data Anomaly / Ghosts' THEN 1 ELSE 0 END) AS ANOMALY_GHOSTS
+FROM CLASSIFIED_DATA
+WHERE EVALUATION_MONTH < DATE_TRUNC('month', CURRENT_DATE()) 
+  AND EVALUATION_MONTH >= DATEADD('month', -24, CURRENT_DATE())
+GROUP BY EVALUATION_MONTH
+ORDER BY EVALUATION_MONTH DESC;
+*/
+
+
+
+-- OPTION C: Get org_uri, account, obs_date mapping
+-- select * from MONTHLY_ACCT_DATA ;
+
+
+-- OPTION D: ENTITY level analysis
+-- select * from WORKSPACE.digitalda_stage.entity_Christian_target_variable limit 1000;
+-- select distinct HISTORICAL_ATTRITION_DECISION from WORKSPACE.digitalda_stage.entity_Christian_target_variable;
+-- select * from WORKSPACE.digitalda_stage.entity_Acct_map_Christian limit 1000;
+
+
+
+-- select HISTORICAL_ATTRITION_DECISION, EVALUATION_MONTH, count(distinct ORG_URI) as entity_count, count(distinct case when ACCOUNT_COUNT=1 then ORG_URI end) as entitycnt_1acc, count(distinct case when ACTIVE_COUNT>0 then ORG_URI end) as entitycnt_activeacc, count(distinct case when year(ATTRITION_DATE)=2025 and attrition_date=EVALUATION_MONTH then ORG_URI end) as entitycnt_2025attr, count(distinct case when year(ATTRITION_DATE)=2026 then ORG_URI end) as entitycnt_2026attr 
+-- from WORKSPACE.digitalda_stage.entity_Christian_target_variable
+-- where year(EVALUATION_MONTH)=2025
+-- and ORG_URI in (select distinct Org_URI from  (select distinct org_uri, accountnumber from WORKSPACE.digitalda_stage.entity_Acct_map_Christian where accountnumber in (select distinct account_id from finance_analytics.nam_portfolio_metrics.d_nam_account where year(adjusted_closed_date)=9999 or adjusted_closed_date is null or year(adjusted_closed_date) in (2024, 2025, 2026) ) ))
+-- group by all
+-- order by EVALUATION_MONTH, HISTORICAL_ATTRITION_DECISION;
+
+
+-- select distinct historical_attrition_decision, count(distinct org_uri) from WORKSPACE.digitalda_stage.entity_Christian_target_variable group by all;
+-- Healthy	                        1906680
+-- Inactive (Graveyard)	            1201351
+-- Event: Risk/Involuntary     	    364958
+-- State: Voluntary (Silent)	    236920
+-- Event: Voluntary (Hard Close)	61323
+-- Event: Flip/Conversion	        44663
+
+-- select account_status, count(distinct account_number)  from COMMON.CUSTOMER.D_ACCOUNT_MASTER where account_number in (select distinct account_id from finance_analytics.nam_portfolio_metrics.d_nam_account) group by all;
+-- Terminated  	1720750
+-- Active      	572247
+-- Suspended   	37547
+-- C           	3859
+-- Unknown     	6

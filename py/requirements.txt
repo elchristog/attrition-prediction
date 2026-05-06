@@ -1,0 +1,9 @@
+snowflake-snowpark-python[pandas]
+pandas
+numpy
+scikit-learn
+lightgbm
+matplotlib
+seaborn
+shap
+python-dotenv
