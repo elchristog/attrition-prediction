@@ -37,17 +37,20 @@ def predict_latest_snapshot(horizon="8M"):
     # 1. Load Model & Feature Engineer from local artifacts (simulating SageMaker Model Load)
     model_dir = os.environ.get('SM_MODEL_DIR', 'attrition_pipeline/artifacts')
     
-    model_path = os.path.join(model_dir, "model.pkl")
-    fe_path = os.path.join(model_dir, "feature_engineer.pkl")
-    
-    if not os.path.exists(model_path) or not os.path.exists(fe_path):
+    # Load HARD model
+    try:
+        with open(os.path.join(model_dir, "model_HARD.pkl"), "rb") as f:
+            model_hard = pickle.load(f)
+        with open(os.path.join(model_dir, "feature_engineer_HARD.pkl"), "rb") as f:
+            fe_hard = pickle.load(f)
+            
+        # Load SILENT model
+        with open(os.path.join(model_dir, "model_SILENT.pkl"), "rb") as f:
+            model_silent = pickle.load(f)
+        with open(os.path.join(model_dir, "feature_engineer_SILENT.pkl"), "rb") as f:
+            fe_silent = pickle.load(f)
+    except FileNotFoundError:
         raise FileNotFoundError(f"Missing model artifacts in {model_dir}. Please run train_model.py first.")
-        
-    with open(model_path, "rb") as f:
-        model = pickle.load(f)
-        
-    with open(fe_path, "rb") as f:
-        fe = pickle.load(f)
         
     # 2. Extract Latest Data from Snowflake
     session = get_snowpark_session()
@@ -109,16 +112,17 @@ def predict_latest_snapshot(horizon="8M"):
         logger.warning(f"Could not load program tier mappings from {tiers_tsv_path}: {e}")
     
     # 3. Apply Feature Engineering in Inference Mode
-    # Using the pre-fit label encoders and feature selectors from training
     logger.info("Applying feature transformations...")
-    X_pred = fe.preprocess_data(df, is_training=False)
+    X_pred_hard = fe_hard.preprocess_data(df, is_training=False)
+    X_pred_silent = fe_silent.preprocess_data(df, is_training=False)
     
     # Sync df to only include the rows that survived feature engineering filters
-    df = df.loc[X_pred.index].copy()
+    df = df.loc[X_pred_hard.index].copy()
     
     # 4. Score Model Probabilities
-    logger.info("Scoring probability predictions using LightGBM model...")
-    y_proba = model.predict_proba(X_pred)[:, 1]
+    logger.info("Scoring probability predictions for HARD and SILENT models...")
+    y_proba_hard = model_hard.predict_proba(X_pred_hard)[:, 1]
+    y_proba_silent = model_silent.predict_proba(X_pred_silent)[:, 1]
     
     # 5. Assemble final predictions output
     # Include total accounts and active/healthy accounts in the final csv
@@ -217,11 +221,13 @@ def predict_latest_snapshot(horizon="8M"):
         cols_to_keep.append('CONTACT_ACCOUNT_ID')
         
     output_df = df[cols_to_keep].copy()
-    output_df[f'PREDICTION_SCORE_{horizon}'] = y_proba
+    output_df[f'PREDICTION_SCORE_HARD_{horizon}'] = y_proba_hard
+    output_df[f'PREDICTION_SCORE_SILENT_{horizon}'] = y_proba_silent
     
     # Sort by descending probability for quick prioritization
-    output_df = output_df.sort_values(by=f'PREDICTION_SCORE_{horizon}', ascending=False)
-    output_df['PREDICTION_RANK'] = output_df[f'PREDICTION_SCORE_{horizon}'].rank(method='min', ascending=False).astype(int)
+    output_df = output_df.sort_values(by=f'PREDICTION_SCORE_HARD_{horizon}', ascending=False)
+    output_df['PREDICTION_RANK_HARD'] = output_df[f'PREDICTION_SCORE_HARD_{horizon}'].rank(method='min', ascending=False).astype(int)
+    output_df['PREDICTION_RANK_SILENT'] = output_df[f'PREDICTION_SCORE_SILENT_{horizon}'].rank(method='min', ascending=False).astype(int)
     
     # Save output to artifacts directory or SageMaker output directory
     output_data_dir = os.environ.get('SM_OUTPUT_DATA_DIR', 'attrition_pipeline/artifacts')
@@ -256,7 +262,7 @@ def predict_latest_snapshot(horizon="8M"):
         stakeholder_df['CONTACT_PROGRAM_ID'] = stakeholder_df.apply(_get_contact_program_id, axis=1)
 
     # Drop columns not needed for stakeholders
-    cols_to_drop = [c for c in ['PREDICTION_RANK', 'STATUS_ACTIVE_COUNT'] if c in stakeholder_df.columns]
+    cols_to_drop = [c for c in ['PREDICTION_RANK_HARD', 'PREDICTION_RANK_SILENT', 'STATUS_ACTIVE_COUNT'] if c in stakeholder_df.columns]
     if cols_to_drop:
         stakeholder_df = stakeholder_df.drop(columns=cols_to_drop)
 

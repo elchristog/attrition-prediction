@@ -22,7 +22,7 @@ os.environ["SNOWPARK_SKIP_SOURCE_CODE_COLLECTION"] = "True"
 logger = logging.getLogger(__name__)
 
 class MultiHorizonProfiler:
-    def __init__(self, targets=("TARGET_3M", "TARGET_6M", "TARGET_8M", "TARGET_12M", "TARGET_HARD_8M", "TARGET_SILENT_8M")):
+    def __init__(self, targets=("TARGET_HARD_8M", "TARGET_SILENT_8M")):
         self.targets = [t.upper() for t in targets]
         self.metrics_store = []
         

@@ -189,7 +189,21 @@ ENTITY_TIME_TRAVEL AS (
         
         -- Moving Average for drop-off detection
         COALESCE(AVG(ENT_GALLONS) OVER (PARTITION BY ORG_URI ORDER BY OBS_DATE ROWS BETWEEN 3 PRECEDING AND 1 PRECEDING), 0) AS AVG_GAL_RECENT,
-        COALESCE(LAG(ENT_GALLONS, 12) OVER (PARTITION BY ORG_URI ORDER BY OBS_DATE), 0) AS GAL_L12
+        COALESCE(LAG(ENT_GALLONS, 12) OVER (PARTITION BY ORG_URI ORDER BY OBS_DATE), 0) AS GAL_L12,
+
+        -- LOOK-AHEAD: Maximum volume in the next 4 months to ensure Attrition is a Terminal State
+        MAX(ENT_GALLONS) OVER (
+            PARTITION BY ORG_URI 
+            ORDER BY OBS_DATE 
+            ROWS BETWEEN 1 FOLLOWING AND 4 FOLLOWING
+        ) AS MAX_GAL_NEXT_4M,
+        
+        -- Count of future months available (to handle the most recent data correctly)
+        COUNT(*) OVER (
+            PARTITION BY ORG_URI 
+            ORDER BY OBS_DATE 
+            ROWS BETWEEN 1 FOLLOWING AND 4 FOLLOWING
+        ) AS FUTURE_MONTHS_AVAILABLE
     FROM ENTITY_MONTHLY_VOL
 ),
 
@@ -206,7 +220,11 @@ SILENT_ATTRITION_EVAL AS (
             -- WAIVER: Physical account must have existed for at least 6 months
             WHEN COALESCE(REAL_MAX_TENURE, 0) < 6 THEN 0
             
-            -- SILENT ATTRITION RULES
+            -- PERSISTENCE CHECK: If the entity recovered within the next 4 months, it is NOT attrition.
+            -- We allow a small threshold (5 gallons) to account for data noise/corrections.
+            WHEN FUTURE_MONTHS_AVAILABLE > 0 AND MAX_GAL_NEXT_4M > 5 THEN 0
+
+            -- SILENT ATTRITION RULES (Only apply if Persistence Check passed)
             WHEN ENT_GALLONS = 0 AND GAL_L1 = 0 AND GAL_L2 = 0 AND GAL_L3 = 0 AND GAL_L4 = 0 AND GAL_L5 = 0 THEN 1
             WHEN ENT_ACTIVE_CARDS <= 20 AND ENT_GALLONS = 0 AND GAL_L1 = 0 AND GAL_L2 = 0 AND GAL_L3 > 0  AND ENT_CREDIT_LIMIT <= COALESCE(CL_L3, 0) THEN 1
             WHEN ENT_ACTIVE_CARDS >= 21 AND ENT_GALLONS = 0 AND GAL_L1 = 0 AND GAL_L2 = 0 AND GAL_L3 > 0 AND ENT_CREDIT_LIMIT <= COALESCE(CL_L3, 0) THEN 1

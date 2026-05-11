@@ -136,12 +136,13 @@ def plot_importance(importance_df, title, filename, output_dir):
     plt.savefig(os.path.join(output_dir, filename), bbox_inches='tight')
     plt.close()
 
-def train_attrition_model(horizon="8M"):
+def train_attrition_model(horizon="8M", attrition_type="HARD"):
     """
-    End-to-end model training pipeline for a specific churn horizon.
+    End-to-end model training pipeline for a specific churn horizon and attrition type.
     """
     horizon = horizon.upper()
-    logger.info(f"Starting training pipeline for {horizon} horizon...")
+    attrition_type = attrition_type.upper()
+    logger.info(f"Starting training pipeline for {horizon} horizon, {attrition_type} attrition...")
     
     # 1. Load Data
     session = get_snowpark_session()
@@ -167,20 +168,13 @@ def train_attrition_model(horizon="8M"):
     session.close()
 
     # 2. Feature Engineering
-    fe = feature_engineering.AttritionFeatureEngineer(horizon=horizon)
+    fe = feature_engineering.AttritionFeatureEngineer(horizon=horizon, attrition_type=attrition_type)
     X, y = fe.preprocess_data(df)
     
-    # 2.1 Prepare segmented targets for evaluation (Hard vs Silent)
-    target_hard_col = f"TARGET_HARD_{horizon}"
-    target_silent_col = f"TARGET_SILENT_{horizon}"
-    
-    # Sync with filtered X index
-    y_hard = df.loc[X.index, target_hard_col] if target_hard_col in df.columns else None
-    y_silent = df.loc[X.index, target_silent_col] if target_silent_col in df.columns else None
-    
-    # 3. Group-level Train/Test Split (stratified by whether the org ever had attrition)
-    # We use ORG_URI to ensure all history of an entity goes to either train or test
-    org_uri_series = df.loc[X.index, 'ORG_URI']
+    # Filter out any instances where target is NaN (if applicable)
+    valid_target_mask = pd.notna(y)
+    X = X[valid_target_mask]
+    y = y[valid_target_mask]
     
     # 3. Group-level Train/Test Split (stratified by whether the org ever had attrition)
     # We use ORG_URI to ensure all history of an entity goes to either train or test
@@ -214,15 +208,6 @@ def train_attrition_model(horizon="8M"):
     X_train, X_test = X[train_mask], X[test_mask]
     y_train, y_test = y[train_mask.values], y[test_mask.values]
     
-    # Mask segmented targets
-    y_test_hard = None
-    y_test_silent = None
-    
-    if y_hard is not None:
-        y_test_hard = y_hard[test_mask]
-    if y_silent is not None:
-        y_test_silent = y_silent[test_mask]
-    
     # 4. Model Training
     logger.info("Training LightGBM model...")
     model = LGBMClassifier(
@@ -243,19 +228,7 @@ def train_attrition_model(horizon="8M"):
     auc_roc = roc_auc_score(y_test, y_proba)
     auc_pr = average_precision_score(y_test, y_proba)
     
-    logger.info(f"Model Results: AUC-ROC: {auc_roc:.4f}, PR-AUC: {auc_pr:.4f}")
-    
-    # 5.1 Segmented Evaluation
-    if y_test_hard is not None:
-        auc_hard = roc_auc_score(y_test_hard, y_proba)
-        pr_hard = average_precision_score(y_test_hard, y_proba)
-        logger.info(f"Segmented Results [HARD ATTRITION]: AUC-ROC: {auc_hard:.4f}, PR-AUC: {pr_hard:.4f}")
-        
-    if y_test_silent is not None:
-        auc_silent = roc_auc_score(y_test_silent, y_proba)
-        pr_silent = average_precision_score(y_test_silent, y_proba)
-        logger.info(f"Segmented Results [SILENT ATTRITION]: AUC-ROC: {auc_silent:.4f}, PR-AUC: {pr_silent:.4f}")
-
+    logger.info(f"Model Results [{attrition_type}]: AUC-ROC: {auc_roc:.4f}, PR-AUC: {auc_pr:.4f}")
     logger.info("\n" + classification_report(y_test, y_pred))
     
     # 6. Decile Analysis / Lift Charts
@@ -263,22 +236,15 @@ def train_attrition_model(horizon="8M"):
     output_data_dir = os.environ.get('SM_OUTPUT_DATA_DIR', 'attrition_pipeline/artifacts')
     os.makedirs(output_data_dir, exist_ok=True)
 
-    # 6.1 Global Lift Chart
-    generate_and_plot_lift_chart(y_test, y_proba, "Global Model", horizon)
-    
-    # 6.2 Segmented Lift Charts
-    if y_test_hard is not None:
-        generate_and_plot_lift_chart(y_test_hard, y_proba, "Hard Attrition Segment", horizon)
-    if y_test_silent is not None:
-        generate_and_plot_lift_chart(y_test_silent, y_proba, "Silent Attrition Segment", horizon)
+    generate_and_plot_lift_chart(y_test, y_proba, f"{attrition_type} Model", horizon)
     
     # 7. Save Model Artifacts
     model_dir = os.environ.get('SM_MODEL_DIR', 'attrition_pipeline/artifacts')
     os.makedirs(model_dir, exist_ok=True)
     
-    with open(os.path.join(model_dir, "model.pkl"), "wb") as f:
+    with open(os.path.join(model_dir, f"model_{attrition_type}.pkl"), "wb") as f:
         pickle.dump(model, f)
-    with open(os.path.join(model_dir, "feature_engineer.pkl"), "wb") as f:
+    with open(os.path.join(model_dir, f"feature_engineer_{attrition_type}.pkl"), "wb") as f:
         pickle.dump(fe, f)
     logger.info(f"Saved model and feature engineer to {model_dir}")
     
@@ -291,26 +257,11 @@ def train_attrition_model(horizon="8M"):
         'importance': model.feature_importances_
     }).sort_values(by='importance', ascending=False)
     
-    plot_importance(importance_df, f"Global Feature Importance - {horizon}", "feature_importance_global.png", output_data_dir)
-    
-    # 8.2 Segmented Importance (Permutation Based)
-    # We use permutation importance to see what features drive the model for each specific segment
-    segments = [
-        ("Hard Attrition", y_test_hard, "feature_importance_hard.png"),
-        ("Silent Attrition", y_test_silent, "feature_importance_silent.png")
-    ]
-    
-    for segment_name, y_segment, filename in segments:
-        if y_segment is not None and len(np.unique(y_segment)) > 1:
-            logger.info(f"Calculating Permutation Importance for {segment_name}...")
-            r = permutation_importance(model, X_test, y_segment, n_repeats=5, random_state=42)
-            
-            seg_importance_df = pd.DataFrame({
-                'feature': X.columns,
-                'importance': r.importances_mean
-            }).sort_values(by='importance', ascending=False)
-            
-            plot_importance(seg_importance_df, f"Feature Importance: {segment_name} ({horizon})", filename, output_data_dir)
+    plot_importance(importance_df, f"Feature Importance - {attrition_type} ({horizon})", f"feature_importance_{attrition_type}.png", output_data_dir)
+
+def train_all_models(horizon="8M"):
+    train_attrition_model(horizon=horizon, attrition_type="HARD")
+    train_attrition_model(horizon=horizon, attrition_type="SILENT")
 
 if __name__ == "__main__":
     import argparse
@@ -318,4 +269,4 @@ if __name__ == "__main__":
     parser.add_argument("--horizon", type=str, default="8M", help="Target horizon (3M, 6M, 8M, 12M)")
     args = parser.parse_args()
     
-    train_attrition_model(horizon=args.horizon)
+    train_all_models(horizon=args.horizon)

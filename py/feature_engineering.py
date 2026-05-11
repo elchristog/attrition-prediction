@@ -2,17 +2,21 @@ import pandas as pd
 import numpy as np
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.feature_selection import SelectFromModel
-from xgboost import XGBClassifier
 import logging
 
 logger = logging.getLogger(__name__)
 
 class AttritionFeatureEngineer:
-    def __init__(self, horizon="6M"):
+    def __init__(self, horizon="6M", attrition_type="HARD"):
         self.label_encoders = {}
         self.feature_cols = []
         self.horizon = horizon.upper()
-        self.target_col = f"TARGET_{self.horizon}"
+        self.attrition_type = attrition_type.upper()
+        if self.attrition_type in ["HARD", "SILENT"]:
+            self.target_col = f"TARGET_{self.attrition_type}_{self.horizon}"
+        else:
+            self.target_col = f"TARGET_{self.horizon}"
+
         
     def preprocess_data(self, df, is_training=True):
         """
@@ -33,7 +37,7 @@ class AttritionFeatureEngineer:
         drop_cols.extend(other_horizons)
         
         # Shubhi's recommendations for Seasonality and Behavioral signals
-        selected_features = [
+        base_features = [
             'SPEND_L3M_VS_BLENDED_RATIO',
             'CONSECUTIVE_INACTIVE_MONTHS',
             'DECLINED_TXN_RATE_L6M',
@@ -46,6 +50,17 @@ class AttritionFeatureEngineer:
             'ENT_CASE_TOTAL_LAG2',
             'ENT_FEES_LAG1'
         ]
+        
+        # Modify these lists to define distinct feature sets for each model type
+        if self.attrition_type == "HARD":
+            # Define specific features for HARD attrition here
+            selected_features = base_features.copy()
+        elif self.attrition_type == "SILENT":
+            # Define specific features for SILENT attrition here
+            selected_features = base_features.copy()
+        else:
+            selected_features = base_features.copy()
+
         
         # Apply history exclusion flags (Clean population for seasonality)
         if 'EXCL_FLAG_HIST_15M' in df.columns:
@@ -84,33 +99,15 @@ class AttritionFeatureEngineer:
         else:
             return features[self.feature_cols]
 
-    def select_features(self, X, y, max_features=30):
-        """
-        Select TOP features based on a quick XGBoost run.
-        """
-        # Check if we have more than one class
-        if len(np.unique(y)) < 2:
-            logger.warning(f"Only one class found in target: {np.unique(y)}. Skipping feature selection.")
-            return X[self.feature_cols[:max_features]] if len(self.feature_cols) > max_features else X
-
-        model = XGBClassifier(n_estimators=100, random_state=42)
-        model.fit(X, y)
-        
-        selector = SelectFromModel(model, max_features=max_features, prefit=True)
-        self.feature_cols = X.columns[selector.get_support()].tolist()
-        
-        logger.info(f"Selected {len(self.feature_cols)} features: {self.feature_cols}")
-        return X[self.feature_cols]
-
 if __name__ == "__main__":
     # Example usage (Mock data)
-    fe = AttritionFeatureEngineer()
+    fe = AttritionFeatureEngineer(attrition_type="HARD")
     # Mock DF
     data = pd.DataFrame({
         "ORG_URI": ["A", "B"],
         "ENT_GALLONS": [100, 200],
         "PARTNER_IND": ["Wex", "Partner"],
-        "TARGET_6M": [0, 1]
+        "TARGET_HARD_6M": [0, 1]
     })
     X, y = fe.preprocess_data(data)
     print(X.head())
