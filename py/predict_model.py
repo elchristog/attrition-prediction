@@ -81,9 +81,9 @@ def predict_latest_snapshot(horizon="8M"):
     logger.info(f"Downloading {row_count} rows for the snapshot {latest_cohort} into Pandas...")
     
     if row_count == 0:
-        logger.error(f"🛑 ABORTANDO: No se encontraron entidades válidas ('Healthy', cuentas activas) para el snapshot del {latest_cohort}.")
-        logger.error("Esto suele suceder si los datos de este mes aún no se han procesado por completo en Snowflake o si el filtrado es muy estricto.")
-        raise ValueError(f"El dataset está vacío para la fecha {latest_cohort} después de aplicar los filtros. Abortando inferencia.")
+        logger.error(f"🛑 ABORTING: No valid entities ('Healthy', active accounts) found for the snapshot of {latest_cohort}.")
+        logger.error("This usually happens if the data for this month has not yet been fully processed in Snowflake or if the filtering is too strict.")
+        raise ValueError(f"The dataset is empty for date {latest_cohort} after applying filters. Aborting inference.")
     
     df = snowpark_df_latest.to_pandas()
     
@@ -96,7 +96,7 @@ def predict_latest_snapshot(horizon="8M"):
         logger.warning(f"Could not load risk mappings: {e}")
         risk_map = {}
         
-    session.close()
+    # session.close() # Moved to the end of the pipeline to allow writing results back to Snowflake
 
     # Load Program Tier mapping from local TSV (PROGRAM_ID → Tier)
     # Use __file__ so the path resolves correctly regardless of the working directory
@@ -266,12 +266,22 @@ def predict_latest_snapshot(horizon="8M"):
     if cols_to_drop:
         stakeholder_df = stakeholder_df.drop(columns=cols_to_drop)
 
-    stakeholder_path = os.path.join(output_data_dir, f"predictions_latest_{horizon}_stakeholders.csv")
+    stakeholder_path = os.path.join(output_data_dir, f"attrition_stakeholder_predictions_{horizon}.csv")
     stakeholder_df.to_csv(stakeholder_path, index=False)
     logger.info(
         f"Saved {len(stakeholder_df)} predictions (stakeholders, {excluded} orgs excluded) to: {stakeholder_path}"
     )
 
+    # 6. Export Stakeholders Table to Snowflake
+    target_table = "WORKSPACE.digitalda_stage.ATTRITION_STAKEHOLDER_PREDICTIONS"
+    logger.info(f"Exporting stakeholder predictions to Snowflake table: {target_table}...")
+    try:
+        session.create_dataframe(stakeholder_df).write.mode("overwrite").save_as_table(target_table)
+        logger.info(f"Successfully exported stakeholder predictions to {target_table}")
+    except Exception as e:
+        logger.error(f"Failed to export stakeholder predictions to Snowflake: {e}")
+
+    session.close()
     logger.info(f"Pipeline execution complete. ✅")
 
 if __name__ == "__main__":
