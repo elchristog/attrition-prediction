@@ -276,6 +276,10 @@ def predict_latest_snapshot(horizon="8M"):
     target_table = "WORKSPACE.digitalda_stage.ATTRITION_STAKEHOLDER_PREDICTIONS"
     logger.info(f"Exporting stakeholder predictions to Snowflake table: {target_table}...")
     try:
+        # Set database and schema context for the session to allow temp stage creation
+        session.use_database("WORKSPACE")
+        session.use_schema("DIGITALDA_STAGE")
+        
         session.create_dataframe(stakeholder_df).write.mode("overwrite").save_as_table(target_table)
         logger.info(f"Successfully exported stakeholder predictions to {target_table}")
     except Exception as e:
