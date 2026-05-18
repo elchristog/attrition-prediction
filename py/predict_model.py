@@ -152,6 +152,8 @@ def predict_latest_snapshot(horizon="8M"):
                     result.append({
                         'account_id': str(item.get('account_id', '')),
                         'program_id': clean_pid,
+                        'spend_mth': item.get('spend_mth', 0),
+                        'gallons_mth': item.get('gallons_mth', 0),
                     })
                 else:
                     result.append({'account_id': str(item), 'program_id': None})
@@ -182,6 +184,8 @@ def predict_latest_snapshot(horizon="8M"):
                     "credit_risk_eligibility": risk_map.get(acc['account_id'], "Unknown"),
                     "program_id": acc['program_id'],
                     "tier": tier_map.get(acc['program_id'], "Unknown") if acc['program_id'] else "Unknown",
+                    "spend_last_month": acc.get('spend_mth', 0),
+                    "gallons_last_month": acc.get('gallons_mth', 0),
                 }
                 for acc in acc_list
             ]
@@ -221,13 +225,34 @@ def predict_latest_snapshot(horizon="8M"):
         cols_to_keep.append('CONTACT_ACCOUNT_ID')
         
     output_df = df[cols_to_keep].copy()
+    
     output_df[f'PREDICTION_SCORE_HARD_{horizon}'] = y_proba_hard
     output_df[f'PREDICTION_SCORE_SILENT_{horizon}'] = y_proba_silent
     
-    # Sort by descending probability for quick prioritization
-    output_df = output_df.sort_values(by=f'PREDICTION_SCORE_HARD_{horizon}', ascending=False)
+    # Calculate individual ranks (1 = highest risk)
     output_df['PREDICTION_RANK_HARD'] = output_df[f'PREDICTION_SCORE_HARD_{horizon}'].rank(method='min', ascending=False).astype(int)
     output_df['PREDICTION_RANK_SILENT'] = output_df[f'PREDICTION_SCORE_SILENT_{horizon}'].rank(method='min', ascending=False).astype(int)
+
+    # 1. Combined Attrition Score: Sum of probabilities (capped at 1.0)
+    # This represents the total probability of 'Any Attrition' assuming disjoint events (per SQL logic)
+    output_df[f'PREDICTION_SCORE_COMBINED_{horizon}'] = (
+        output_df[f'PREDICTION_SCORE_HARD_{horizon}'] + 
+        output_df[f'PREDICTION_SCORE_SILENT_{horizon}']
+    ).clip(upper=1.0)
+
+    # 2. Definitive Combined Rank: Based on the best rank from either model (Min-Rank)
+    # This ensures high-risk individuals in the 'Hard' segment are not buried by the larger 'Silent' segment
+    # We calculate a raw min-rank first, then break ties with the score to get a clean 1, 2, 3... sequence
+    output_df['PREDICTION_RANK_TMP'] = output_df[['PREDICTION_RANK_HARD', 'PREDICTION_RANK_SILENT']].min(axis=1)
+    
+    output_df = output_df.sort_values(
+        by=['PREDICTION_RANK_TMP', f'PREDICTION_SCORE_COMBINED_{horizon}'], 
+        ascending=[True, False]
+    )
+    
+    # Assign unique, sequential rank
+    output_df['PREDICTION_RANK_COMBINED'] = range(1, len(output_df) + 1)
+    output_df.drop(columns=['PREDICTION_RANK_TMP'], inplace=True)
     
     # Save output to artifacts directory or SageMaker output directory
     output_data_dir = os.environ.get('SM_OUTPUT_DATA_DIR', 'attrition_pipeline/artifacts')
@@ -261,7 +286,7 @@ def predict_latest_snapshot(horizon="8M"):
             return None
         stakeholder_df['CONTACT_PROGRAM_ID'] = stakeholder_df.apply(_get_contact_program_id, axis=1)
 
-    # Drop columns not needed for stakeholders
+    # Drop columns not needed for stakeholders, but keep the combined ones
     cols_to_drop = [c for c in ['PREDICTION_RANK_HARD', 'PREDICTION_RANK_SILENT', 'STATUS_ACTIVE_COUNT'] if c in stakeholder_df.columns]
     if cols_to_drop:
         stakeholder_df = stakeholder_df.drop(columns=cols_to_drop)

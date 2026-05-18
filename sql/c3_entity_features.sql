@@ -67,7 +67,9 @@ entity_monthly_snapshot AS (
         COUNT(DISTINCT account_id) AS account_count,
         ARRAY_AGG(OBJECT_CONSTRUCT(
             'account_id', account_id::VARCHAR,
-            'program_id', program_id::VARCHAR
+            'program_id', program_id::VARCHAR,
+            'spend_mth', gross_spend_mth,
+            'gallons_mth', gallons_mth
         )) AS account_id_list,
         
         -- Summation metrics
@@ -188,9 +190,10 @@ entity_rolling AS (
         MAX(ent_exposure) OVER (PARTITION BY org_uri ORDER BY cohort_month ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS ent_exposure_max_3m,
         AVG(ent_exposure) OVER (PARTITION BY org_uri ORDER BY cohort_month ROWS BETWEEN 5 PRECEDING AND CURRENT ROW) AS ent_exposure_avg_6m,
         
-        -- Lagged Fees (T-1, T-2)
+        -- Lagged Fees (T-1, T-2, T-4)
         LAG(ent_fees, 1) OVER (PARTITION BY org_uri ORDER BY cohort_month) AS ent_fees_lag1,
         LAG(ent_fees, 2) OVER (PARTITION BY org_uri ORDER BY cohort_month) AS ent_fees_lag2,
+        LAG(ent_fees, 4) OVER (PARTITION BY org_uri ORDER BY cohort_month) AS ent_fees_lag4,
 
         -- Lagged Case Features (T-1, T-2)
         LAG(ent_case_total, 1) OVER (PARTITION BY org_uri ORDER BY cohort_month) AS ent_case_total_lag1,

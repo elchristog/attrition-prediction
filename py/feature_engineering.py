@@ -53,11 +53,33 @@ class AttritionFeatureEngineer:
         
         # Modify these lists to define distinct feature sets for each model type
         if self.attrition_type == "HARD":
-            # Define specific features for HARD attrition here
-            selected_features = base_features.copy()
+            selected_features = [
+                'SPEND_L3M_VS_BLENDED_RATIO',
+                'DECLINED_TXN_RATE_L6M',
+                'ACTIVE_MONTHS_RATE_L12M',
+                'FEE_TO_REVENUE_RATIO_MTH',
+                'ENT_GALLONS_VELOCITY_3V12',
+                'IS_TRUCKING_INDUSTRY',
+                'ACCOUNT_COUNT',
+                'ENT_CASE_TOTAL_LAG2',
+                'ENT_FEES_LAG1',
+                'IS_SMALL_BIZ'
+            ]
         elif self.attrition_type == "SILENT":
-            # Define specific features for SILENT attrition here
-            selected_features = base_features.copy()
+            selected_features = [
+                'SPEND_L3M_VS_BLENDED_RATIO',
+                'DECLINED_TXN_RATE_L6M',
+                'ACTIVE_MONTHS_RATE_L12M',
+                'FEE_TO_REVENUE_RATIO_MTH_LAG1', # Use the lagged fee ratio for silent attrition
+                'ENT_GALLONS_VELOCITY_3V12',
+                'IS_TRUCKING_INDUSTRY',
+                'ACCOUNT_COUNT',
+                'ENT_CASE_TOTAL_LAG2',
+                'ENT_FEES_LAG1', # lag to capture earlier behavioral signals for silent attrition
+                'HISTORICAL_MAX_DROP_PCT',
+                'IS_SMALL_BIZ',
+                'ENT_GALLONS_AVG_3M'
+            ]
         else:
             selected_features = base_features.copy()
 

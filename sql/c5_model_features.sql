@@ -39,9 +39,9 @@ rolling AS (
         AVG(ent_txns) OVER (PARTITION BY org_uri ORDER BY cohort_month ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS ent_txns_avg_3m,
         AVG(ent_txns) OVER (PARTITION BY org_uri ORDER BY cohort_month ROWS BETWEEN 11 PRECEDING AND CURRENT ROW) AS ent_txns_avg_12m,
         SUM(ent_txns) OVER (PARTITION BY org_uri ORDER BY cohort_month ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS ent_txns_sum_3m,
-        SUM(ent_txns) OVER (PARTITION BY org_uri ORDER BY cohort_month ROWS BETWEEN 5 PRECEDING AND CURRENT ROW) AS ent_txns_sum_6m,
+        SUM(ent_txns) OVER (PARTITION BY org_uri ORDER BY cohort_month ROWS BETWEEN 6 PRECEDING AND 1 PRECEDING) AS ent_txns_sum_6m,
         SUM(ent_declined_txns) OVER (PARTITION BY org_uri ORDER BY cohort_month ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS ent_declined_txns_sum_3m,
-        SUM(ent_declined_txns) OVER (PARTITION BY org_uri ORDER BY cohort_month ROWS BETWEEN 5 PRECEDING AND CURRENT ROW) AS ent_declined_txns_sum_6m,
+        SUM(ent_declined_txns) OVER (PARTITION BY org_uri ORDER BY cohort_month ROWS BETWEEN 6 PRECEDING AND 1 PRECEDING) AS ent_declined_txns_sum_6m,
         AVG(ent_sr_count) OVER (PARTITION BY org_uri ORDER BY cohort_month ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS ent_sr_count_avg_3m,
         AVG(ent_sr_count) OVER (PARTITION BY org_uri ORDER BY cohort_month ROWS BETWEEN 5 PRECEDING AND CURRENT ROW) AS ent_sr_count_avg_6m,
         SUM(ent_case_fee_waiver_count) OVER (PARTITION BY org_uri ORDER BY cohort_month ROWS BETWEEN 5 PRECEDING AND CURRENT ROW) AS ent_case_fee_waiver_sum_6m,
@@ -160,6 +160,8 @@ SELECT
     (r.ENT_DECLINED_TXNS_SUM_6M / NULLIF(r.ENT_TXNS_SUM_6M + r.ENT_DECLINED_TXNS_SUM_6M, 0)) AS DECLINED_TXN_RATE_L6M,
     (r.ENT_REVENUE / NULLIF(r.ENT_GALLONS, 0)) AS REVENUE_PER_GALLON_MTH,
     (r.ENT_FEES / NULLIF(r.ENT_REVENUE, 0)) AS FEE_TO_REVENUE_RATIO_MTH,
+    LAG(r.ENT_FEES / NULLIF(r.ENT_REVENUE, 0), 1) OVER (PARTITION BY r.org_uri ORDER BY r.cohort_month) AS FEE_TO_REVENUE_RATIO_MTH_LAG1,
+    LAG(r.ENT_FEES / NULLIF(r.ENT_REVENUE, 0), 4) OVER (PARTITION BY r.org_uri ORDER BY r.cohort_month) AS FEE_TO_REVENUE_RATIO_MTH_LAG4,
     NULL AS LATE_FEE_TO_TOTAL_FEE_RATIO,
     NULL AS SR_RESOLUTION_RATE_MTH,
     NULL AS SR_RESOLUTION_RATE_L6M,
@@ -197,7 +199,11 @@ SELECT
     r.is_trucking_industry AS IS_TRUCKING_INDUSTRY,
     r.ACCOUNT_COUNT AS ACCOUNT_COUNT,
     r.ENT_CASE_TOTAL_LAG2 AS ENT_CASE_TOTAL_LAG2,
-    r.ENT_FEES_LAG1 AS ENT_FEES_LAG1
+    r.ENT_FEES_LAG1 AS ENT_FEES_LAG1,
+    r.ENT_FEES_LAG4 AS ENT_FEES_LAG4,
+    r.is_small_biz AS IS_SMALL_BIZ,
+    r.historical_max_drop_pct AS HISTORICAL_MAX_DROP_PCT,
+    r.ent_gallons_avg_3m AS ENT_GALLONS_AVG_3M
 FROM rolling r
 LEFT JOIN entity_history eh
     ON eh.ORG_URI = r.ORG_URI AND eh.cohort_month = r.cohort_month
