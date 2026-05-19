@@ -136,7 +136,7 @@ def plot_importance(importance_df, title, filename, output_dir):
     plt.savefig(os.path.join(output_dir, filename), bbox_inches='tight')
     plt.close()
 
-def train_attrition_model(horizon="8M", attrition_type="HARD"):
+def train_attrition_model(horizon="8M", attrition_type="HARD", exclude_csv=None):
     """
     End-to-end model training pipeline for a specific churn horizon and attrition type.
     """
@@ -166,6 +166,20 @@ def train_attrition_model(horizon="8M", attrition_type="HARD"):
 
     df = snowpark_df.to_pandas()
     session.close()
+
+    # 1.2 Apply temporary exclusion list if provided
+    if exclude_csv and os.path.exists(exclude_csv):
+        try:
+            exclude_df = pd.read_csv(exclude_csv)
+            if 'ORG_URI' in exclude_df.columns:
+                orgs_to_exclude = exclude_df['ORG_URI'].unique()
+                initial_df_len = len(df)
+                df = df[~df['ORG_URI'].isin(orgs_to_exclude)]
+                logger.info(f"Temporary Exclusion Filtering: Removed {initial_df_len - len(df)} rows corresponding to {len(orgs_to_exclude)} excluded ORG_URIs.")
+            else:
+                logger.warning(f"Could not find 'ORG_URI' column in {exclude_csv}. Skipping temporary exclusion.")
+        except Exception as e:
+            logger.error(f"Error loading exclusion CSV {exclude_csv}: {e}")
 
     # 2. Feature Engineering
     fe = feature_engineering.AttritionFeatureEngineer(horizon=horizon, attrition_type=attrition_type)
@@ -259,14 +273,15 @@ def train_attrition_model(horizon="8M", attrition_type="HARD"):
     
     plot_importance(importance_df, f"Feature Importance - {attrition_type} ({horizon})", f"feature_importance_{attrition_type}.png", output_data_dir)
 
-def train_all_models(horizon="8M"):
-    train_attrition_model(horizon=horizon, attrition_type="HARD")
-    train_attrition_model(horizon=horizon, attrition_type="SILENT")
+def train_all_models(horizon="8M", exclude_csv=None):
+    train_attrition_model(horizon=horizon, attrition_type="HARD", exclude_csv=exclude_csv)
+    train_attrition_model(horizon=horizon, attrition_type="SILENT", exclude_csv=exclude_csv)
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--horizon", type=str, default="8M", help="Target horizon (3M, 6M, 8M, 12M)")
+    parser.add_argument("--exclude_csv", type=str, default=None, help="Path to CSV containing ORG_URIs to exclude (temporary fix)")
     args = parser.parse_args()
     
-    train_all_models(horizon=args.horizon)
+    train_all_models(horizon=args.horizon, exclude_csv=args.exclude_csv)
