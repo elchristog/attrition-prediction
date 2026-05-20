@@ -14,26 +14,47 @@ WITH account_features AS (
 -- ══════════════════════════════════════════════════════════════
 -- CTE 1: Account-to-Entity Mapping (SCD2 Bridge)
 -- ══════════════════════════════════════════════════════════════
+anchor_records AS (
+    SELECT 
+        account_uri,
+        organization_uri AS org_uri
+    FROM PREP.MDM_RELTIO.f_entity_wxaccountnumber_organization_snapshot
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY account_uri 
+        ORDER BY 
+            -- Priority 1: Was active exactly on March 1, 2026
+            CASE WHEN row_eff_begin_dttm <= '2026-03-01'::DATE AND (row_eff_end_dttm IS NULL OR row_eff_end_dttm > '2026-03-01'::DATE) THEN 1 
+            -- Priority 2: Started after March 1, 2026 (get the earliest one)
+                 WHEN row_eff_begin_dttm > '2026-03-01'::DATE THEN 2
+            -- Priority 3: Ended before March 1, 2026 (get the latest one)
+                 ELSE 3 END,
+            CASE WHEN row_eff_begin_dttm > '2026-03-01'::DATE THEN row_eff_begin_dttm END ASC,
+            row_eff_begin_dttm DESC
+    ) = 1
+),
+
 historical_bridge AS (
+    -- Standard SCD2 Condition for reliable periods (On or after March 2026)
     SELECT
         c.cohort_month,
         snap.account_uri,
         snap.organization_uri AS org_uri
     FROM (SELECT DISTINCT cohort_month FROM account_features) c
     JOIN PREP.MDM_RELTIO.f_entity_wxaccountnumber_organization_snapshot snap
-        ON (
-            c.cohort_month >= snap.row_eff_begin_dttm
-            AND (c.cohort_month < snap.row_eff_end_dttm OR snap.row_eff_end_dttm IS NULL)
-        )
-        OR (
-            -- Infinite Patch logic matches C1
-            c.cohort_month < snap.row_eff_begin_dttm
-            AND snap.row_eff_begin_dttm = (
-                SELECT MIN(s2.row_eff_begin_dttm)
-                FROM PREP.MDM_RELTIO.f_entity_wxaccountnumber_organization_snapshot s2
-                WHERE s2.account_uri = snap.account_uri
-            )
-        )
+        ON c.cohort_month >= '2026-03-01'::DATE
+        AND c.cohort_month >= snap.row_eff_begin_dttm
+        AND (c.cohort_month < snap.row_eff_end_dttm OR snap.row_eff_end_dttm IS NULL)
+
+    UNION ALL
+
+    -- Retroactive patch for dates BEFORE March 2026
+    SELECT
+        c.cohort_month,
+        a.account_uri,
+        a.org_uri
+    FROM (SELECT DISTINCT cohort_month FROM account_features) c
+    CROSS JOIN anchor_records a
+    WHERE c.cohort_month < '2026-03-01'::DATE
 ),
 
 -- ══════════════════════════════════════════════════════════════

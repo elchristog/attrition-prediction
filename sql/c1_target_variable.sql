@@ -11,31 +11,48 @@ CALENDAR AS (
 ),
 
 -- 2. THE HISTORICAL BRIDGE (With Infinite Retroactivity Patch)
--- This logic solves the "Day Zero" issue where Reltio history only starts in Oct 2024.
+-- This logic solves the MDM stabilization issue by freezing relationships prior to March 2026.
+ANCHOR_RECORDS AS (
+    SELECT 
+        ACCOUNT_URI,
+        ORGANIZATION_URI AS ORG_URI
+    FROM PREP.MDM_RELTIO.f_entity_wxaccountnumber_organization_snapshot
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY ACCOUNT_URI 
+        ORDER BY 
+            -- Priority 1: Was active exactly on March 1, 2026
+            CASE WHEN ROW_EFF_BEGIN_DTTM <= '2026-03-01'::DATE AND (ROW_EFF_END_DTTM IS NULL OR ROW_EFF_END_DTTM > '2026-03-01'::DATE) THEN 1 
+            -- Priority 2: Started after March 1, 2026 (get the earliest one)
+                 WHEN ROW_EFF_BEGIN_DTTM > '2026-03-01'::DATE THEN 2
+            -- Priority 3: Ended before March 1, 2026 (get the latest one)
+                 ELSE 3 END,
+            CASE WHEN ROW_EFF_BEGIN_DTTM > '2026-03-01'::DATE THEN ROW_EFF_BEGIN_DTTM END ASC,
+            ROW_EFF_BEGIN_DTTM DESC
+    ) = 1
+),
+
 HISTORICAL_BRIDGE AS (
+    -- Standard SCD2 Condition for reliable periods (On or after March 2026)
     SELECT 
         c.OBS_DATE,
         snap.ACCOUNT_URI,
         snap.ORGANIZATION_URI AS ORG_URI
     FROM CALENDAR c
     JOIN PREP.MDM_RELTIO.f_entity_wxaccountnumber_organization_snapshot snap
-        ON 
-        (
-            -- Standard SCD2 Condition: Observation falls within the record's validity window
-            c.OBS_DATE >= snap.ROW_EFF_BEGIN_DTTM 
-            AND (c.OBS_DATE < snap.ROW_EFF_END_DTTM OR snap.ROW_EFF_END_DTTM IS NULL)
-        )
-        OR 
-        (
-            -- INFINITE PATCH: If observation date is BEFORE Reltio's inception (Oct 2024),
-            -- we assume the account belonged to the earliest known Entity in the snapshot.
-            c.OBS_DATE < snap.ROW_EFF_BEGIN_DTTM
-            AND snap.ROW_EFF_BEGIN_DTTM = (
-                SELECT MIN(s2.ROW_EFF_BEGIN_DTTM) 
-                FROM PREP.MDM_RELTIO.f_entity_wxaccountnumber_organization_snapshot s2 
-                WHERE s2.ACCOUNT_URI = snap.ACCOUNT_URI
-            )
-        )
+        ON c.OBS_DATE >= '2026-03-01'::DATE
+        AND c.OBS_DATE >= snap.ROW_EFF_BEGIN_DTTM 
+        AND (c.OBS_DATE < snap.ROW_EFF_END_DTTM OR snap.ROW_EFF_END_DTTM IS NULL)
+        
+    UNION ALL
+    
+    -- Retroactive patch for dates BEFORE March 2026
+    SELECT 
+        c.OBS_DATE,
+        a.ACCOUNT_URI,
+        a.ORG_URI
+    FROM CALENDAR c
+    CROSS JOIN ANCHOR_RECORDS a
+    WHERE c.OBS_DATE < '2026-03-01'::DATE
 ),
 
 -- ============================================================================
@@ -213,9 +230,9 @@ SILENT_ATTRITION_EVAL AS (
         OBS_DATE,
         
         CASE 
-            -- WAIVER: We waive the 6-month MDM history requirement for years 2024 and prior 
+            -- WAIVER: We waive the 6-month MDM history requirement for dates prior to March 2026 
             -- to allow the Infinite Retroactivity patch to label the historical training set.
-            WHEN MDM_HISTORY_MONTHS_AVAILABLE < 6 AND OBS_DATE >= '2025-01-01'::DATE THEN 0
+            WHEN MDM_HISTORY_MONTHS_AVAILABLE < 6 AND OBS_DATE >= '2026-03-01'::DATE THEN 0
             
             -- WAIVER: Physical account must have existed for at least 6 months
             WHEN COALESCE(REAL_MAX_TENURE, 0) < 6 THEN 0
