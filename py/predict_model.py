@@ -54,6 +54,29 @@ def predict_latest_snapshot(horizon="8M"):
         
     # 2. Extract Latest Data from Snowflake
     session = get_snowpark_session()
+    
+    # 2a. Execute C6 Distance/Density Pipeline to ensure latest data
+    logger.info("Executing C6 Distance/Density SQL Pipeline...")
+    try:
+        _script_dir = os.path.dirname(os.path.abspath(__file__))
+        sql_path = os.path.normpath(os.path.join(_script_dir, '..', 'sql', 'c6_distance_density.sql'))
+        from run_sql_updates import run_sql_file
+        run_sql_file(session, sql_path)
+    except Exception as e:
+        logger.error(f"Failed to execute C6 Distance/Density pipeline: {e}")
+        
+    # 2b. Fetch Distance/Density Data into Pandas
+    logger.info("Fetching Distance/Density metrics into Pandas...")
+    try:
+        # Load distance metrics, standardizing column names to uppercase for dictionary mapping
+        distance_df = session.sql("SELECT ACCOUNTNUMBER, CLOSEST_SITE_DISTANCE_MILES, SITES_WITHIN_5_MI, SITES_WITHIN_25_MI, ACCOUNT_FOOTPRINT_CLASS FROM WORKSPACE.digitalda_stage.ACCOUNT_DISTANCE_DENSITY_C6").to_pandas()
+        distance_df.columns = [c.upper() for c in distance_df.columns]
+        distance_map = distance_df.set_index('ACCOUNTNUMBER').to_dict('index')
+        logger.info(f"Loaded distance/density metrics for {len(distance_map)} accounts.")
+    except Exception as e:
+        logger.error(f"Failed to load distance/density metrics: {e}")
+        distance_map = {}
+
     snowpark_df = load_training_data(session, table_name="WORKSPACE.digitalda_stage.ML_Model_Features_C5")
     
     # Keep active and valid accounts for scoring (we don't apply target exclusion flags since it's the future)
@@ -186,6 +209,10 @@ def predict_latest_snapshot(horizon="8M"):
                     "tier": tier_map.get(acc['program_id'], "Unknown") if acc['program_id'] else "Unknown",
                     "spend_last_month": acc.get('spend_mth', 0),
                     "gallons_last_month": acc.get('gallons_mth', 0),
+                    "closest_site_distance_miles": distance_map.get(acc['account_id'], {}).get('CLOSEST_SITE_DISTANCE_MILES', None),
+                    "sites_within_5_mi": distance_map.get(acc['account_id'], {}).get('SITES_WITHIN_5_MI', 0),
+                    "sites_within_25_mi": distance_map.get(acc['account_id'], {}).get('SITES_WITHIN_25_MI', 0),
+                    "account_footprint_class": distance_map.get(acc['account_id'], {}).get('ACCOUNT_FOOTPRINT_CLASS', 'Unknown'),
                 }
                 for acc in acc_list
             ]
@@ -199,30 +226,84 @@ def predict_latest_snapshot(horizon="8M"):
                     return True
             return False
 
-        def select_contact_account(details_json):
+        def apply_selection_rules(details_json):
             """
-            From the already-enriched ACCOUNT_DETAILS_LIST JSON, pick the account_id
-            of the account we should contact.
-            - Single account: that account.
-            - Multiple accounts: the one with the highest-priority tier.
-              Priority: Tier 1 Universal > Tier 1 > Tier 2 Universal > Tier 2 > ...
+            Rule engine combining Profitability Tiering and Geo Distance/Density.
+            Returns a dictionary with the selected account_id and the rule_code.
             """
             try:
                 accounts = json.loads(details_json) if isinstance(details_json, str) else details_json
             except Exception:
-                return None
+                return {"account_id": None, "rule_code": "ERROR"}
             if not accounts:
-                return None
-            best = min(accounts, key=lambda a: _tier_priority(a.get('tier', 'Unknown')))
-            return best.get('account_id')
+                return {"account_id": None, "rule_code": "ERROR"}
+
+            # Sort by profitability tier (0 is highest priority)
+            accounts_sorted = sorted(accounts, key=lambda a: _tier_priority(a.get('tier', 'Unknown')))
+            contact_account = accounts_sorted[0]
+
+            # R1: Single account entity
+            if len(accounts) == 1:
+                return {"account_id": contact_account.get('account_id'), "rule_code": "R1"}
+
+            # Assumptions
+            T_5MI_MIN = 3
+            T_CLOSEST_MI = 2.0
+            T_GEO_GAP = 3
+
+            def get_sites_5mi(acc):
+                val = acc.get('sites_within_5_mi')
+                return int(val) if val is not None else None
+                
+            def get_closest_mi(acc):
+                val = acc.get('closest_site_distance_miles')
+                return float(val) if val is not None else None
+
+            contact_sites = get_sites_5mi(contact_account)
+            contact_closest = get_closest_mi(contact_account)
+
+            # R5: No geo data
+            if contact_sites is None or contact_closest is None:
+                return {"account_id": contact_account.get('account_id'), "rule_code": "R5"}
+
+            # R2: WELL-COVERED
+            if contact_sites >= T_5MI_MIN and contact_closest <= T_CLOSEST_MI:
+                return {"account_id": contact_account.get('account_id'), "rule_code": "R2"}
+
+            # R3 & R4: POORLY COVERED. Look for Best Alternative Account.
+            alt_accounts = [a for a in accounts_sorted[1:] if get_sites_5mi(a) is not None]
+            
+            if not alt_accounts:
+                return {"account_id": contact_account.get('account_id'), "rule_code": "R4"}
+
+            # Tie-breaking logic: Maximize sites_within_5_mi, then best Tier, then shortest closest_distance
+            def alt_key(a):
+                sites = get_sites_5mi(a)
+                tier_p = _tier_priority(a.get('tier', 'Unknown'))
+                dist = get_closest_mi(a)
+                dist_val = dist if dist is not None else 9999.0
+                return (sites, -tier_p, -dist_val)
+
+            best_alt = max(alt_accounts, key=alt_key)
+            geo_gap = get_sites_5mi(best_alt) - contact_sites
+
+            # R3: SWITCH
+            if geo_gap >= T_GEO_GAP:
+                return {"account_id": best_alt.get('account_id'), "rule_code": "R3"}
+            
+            # R4: KEEP
+            return {"account_id": contact_account.get('account_id'), "rule_code": "R4"}
 
         df['ACCOUNT_DETAILS_LIST'] = df['ACCOUNT_ID_LIST'].apply(enrich_accounts)
         df['HAS_INELIGIBLE_ACCOUNT'] = df['ACCOUNT_ID_LIST'].apply(check_ineligible)
-        df['CONTACT_ACCOUNT_ID'] = df['ACCOUNT_DETAILS_LIST'].apply(select_contact_account)
+        df['SELECTION_RESULT'] = df['ACCOUNT_DETAILS_LIST'].apply(apply_selection_rules)
+        df['CONTACT_ACCOUNT_ID'] = df['SELECTION_RESULT'].apply(lambda x: x['account_id'])
+        df['CONTACT_SELECTION_RULE'] = df['SELECTION_RESULT'].apply(lambda x: x['rule_code'])
 
         cols_to_keep.append('ACCOUNT_DETAILS_LIST')
         cols_to_keep.append('HAS_INELIGIBLE_ACCOUNT')
         cols_to_keep.append('CONTACT_ACCOUNT_ID')
+        cols_to_keep.append('CONTACT_SELECTION_RULE')
         
     output_df = df[cols_to_keep].copy()
     
