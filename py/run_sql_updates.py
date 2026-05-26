@@ -16,26 +16,28 @@ def run_sql_file(session, file_path):
             session.sql(stmt).collect()
     print(f"Successfully executed {file_path}")
 
-try:
-    session = get_snowpark_session()
-    
-    # Resolve absolute paths relative to this script
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    sql_dir = os.path.join(os.path.dirname(script_dir), 'sql')
-    
-    # Run C2 (Update account-level features)
-    run_sql_file(session, os.path.join(sql_dir, 'c2_account_features.sql'))
-    
-    # Run C3
-    run_sql_file(session, os.path.join(sql_dir, 'c3_entity_features.sql'))
-    
-    # Run C4 (regenerate master table with new features)
-    run_sql_file(session, os.path.join(sql_dir, 'c4_target_table.sql'))
+if __name__ == '__main__':
+    try:
+        session = get_snowpark_session()
+        
+        # Resolve absolute paths relative to this script
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        sql_dir = os.path.join(os.path.dirname(script_dir), 'sql')
+        
+        # Run C2 (Update account-level features)
+        run_sql_file(session, os.path.join(sql_dir, 'c2_account_features.sql'))
+        
+        # Run C3
+        run_sql_file(session, os.path.join(sql_dir, 'c3_entity_features.sql'))
+        
+        # Run C4 (regenerate master table with new features)
+        run_sql_file(session, os.path.join(sql_dir, 'c4_target_table.sql'))
 
-    # Run C5 (compound features and history flags)
-    run_sql_file(session, os.path.join(sql_dir, 'c5_model_features.sql'))
-    
-    session.close()
-    print("Pipeline updated successfully.")
-except Exception as e:
-    print(f"ERROR: {str(e)}")
+        # Run C5 (compound features and history flags)
+        run_sql_file(session, os.path.join(sql_dir, 'c5_model_features.sql'))
+        
+        session.close()
+        print("Pipeline updated successfully.")
+    except Exception as e:
+        print(f"ERROR: {str(e)}")
+
