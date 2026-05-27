@@ -26,7 +26,7 @@ from feature_engineering import AttritionFeatureEngineer
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-def predict_latest_snapshot(horizon="8M"):
+def predict_latest_snapshot(horizon="8M", min_spend=1000.0):
     """
     End-to-end inference script that pulls the most recent snapshot logic 
     and outputs probabilities using a trained LightGBM model.
@@ -377,10 +377,27 @@ def predict_latest_snapshot(horizon="8M"):
     # Stakeholder file — exclude orgs that have at least one ineligible account
     if 'HAS_INELIGIBLE_ACCOUNT' in output_df.columns:
         stakeholder_df = output_df[output_df['HAS_INELIGIBLE_ACCOUNT'] == False].copy()
-        excluded = len(output_df) - len(stakeholder_df)
     else:
         stakeholder_df = output_df.copy()
-        excluded = 0
+
+    # Filter out entities that do not have at least one account with spend_last_month > min_spend
+    if 'ACCOUNT_DETAILS_LIST' in stakeholder_df.columns:
+        import json as _json
+        def has_enough_spend(details_json):
+            try:
+                accounts = _json.loads(details_json) if isinstance(details_json, str) else details_json
+                if not accounts:
+                    return False
+                return any(float(acc.get('spend_last_month', 0)) > min_spend for acc in accounts)
+            except Exception:
+                return False
+        
+        before_spend_filter = len(stakeholder_df)
+        stakeholder_df = stakeholder_df[stakeholder_df['ACCOUNT_DETAILS_LIST'].apply(has_enough_spend)].copy()
+        spend_excluded = before_spend_filter - len(stakeholder_df)
+        logger.info(f"Excluded {spend_excluded} orgs due to no accounts exceeding minimum spend threshold of {min_spend}")
+    
+    excluded = len(output_df) - len(stakeholder_df)
 
     # Add CONTACT_PROGRAM_ID: the program_id of the elected contact account
     if 'ACCOUNT_DETAILS_LIST' in stakeholder_df.columns and 'CONTACT_ACCOUNT_ID' in stakeholder_df.columns:
@@ -428,6 +445,7 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--horizon", type=str, default="8M", help="Target horizon model to use for inference")
+    parser.add_argument("--min-spend", type=float, default=1000.0, help="Minimum last month spend for at least one account in stakeholder export")
     args = parser.parse_args()
     
-    predict_latest_snapshot(horizon=args.horizon)
+    predict_latest_snapshot(horizon=args.horizon, min_spend=args.min_spend)
