@@ -97,8 +97,38 @@ def predict_latest_snapshot(horizon="8M"):
         
     logger.info(f"Identified latest valid COHORT_MONTH for inference: {latest_cohort}")
     
+    # Standardize latest_cohort to a date string YYYY-MM-DD to avoid timestamp/timezone mismatch issues
+    latest_cohort_str = latest_cohort.strftime("%Y-%m-%d") if hasattr(latest_cohort, 'strftime') else str(latest_cohort)[:10]
+    logger.info(f"Using cohort date string for filters: {latest_cohort_str}")
+
     # Filter down to the specific latest valid snapshot
     snowpark_df_latest = snowpark_df_valid.filter(F.col("COHORT_MONTH") == latest_cohort)
+    
+    # 2c. Filter out entities that do not have volume_month in the latest cohort
+    logger.info("Filtering entities to only those with a volume record in the current month...")
+    try:
+        active_orgs = (
+            session.table("FINANCE_ANALYTICS.NAM_PORTFOLIO_METRICS.NAM_ACCOUNT_ATTRITION")
+            .filter(F.date_trunc("month", F.col("VOLUME_MONTH")) == F.date_trunc("month", F.to_date(F.lit(latest_cohort_str))))
+            .join(
+                session.table("PREP.MDM_RELTIO.entity_wxaccountnumber"),
+                F.col("SOURCE_ACCOUNT_ID") == F.col("ACCOUNTNUMBER"),
+            )
+            .join(
+                session.table("PREP.MDM_RELTIO.f_entity_wxaccountnumber_organization_snapshot"),
+                (F.col("URI") == F.col("ACCOUNT_URI")) &
+                (F.to_date(F.lit(latest_cohort_str)) >= F.to_date(F.col("ROW_EFF_BEGIN_DTTM"))) &
+                ((F.col("ROW_EFF_END_DTTM").is_null()) | (F.to_date(F.lit(latest_cohort_str)) < F.to_date(F.col("ROW_EFF_END_DTTM"))))
+            )
+            .select(F.col("ORGANIZATION_URI").alias("ORG_URI"))
+            .distinct()
+        )
+            
+        snowpark_df_latest = snowpark_df_latest.join(active_orgs, on="ORG_URI", how="inner")
+        logger.info("Successfully filtered to active volume entities in Snowpark.")
+    except Exception as e:
+        logger.error(f"Failed to apply volume_month filter: {e}")
+        raise
     
     row_count = snowpark_df_latest.count()
     logger.info(f"Downloading {row_count} rows for the snapshot {latest_cohort} into Pandas...")
