@@ -26,7 +26,7 @@ from feature_engineering import AttritionFeatureEngineer
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-def predict_latest_snapshot(horizon="8M", min_spend=1000.0):
+def predict_latest_snapshot(horizon="8M", min_gallons=100.0):
     """
     End-to-end inference script that pulls the most recent snapshot logic 
     and outputs probabilities using a trained LightGBM model.
@@ -380,22 +380,23 @@ def predict_latest_snapshot(horizon="8M", min_spend=1000.0):
     else:
         stakeholder_df = output_df.copy()
 
-    # Filter out entities that do not have at least one account with spend_last_month > min_spend
+    # Filter out entities that do not have total_gallons_last_month >= min_gallons
     if 'ACCOUNT_DETAILS_LIST' in stakeholder_df.columns:
         import json as _json
-        def has_enough_spend(details_json):
+        def has_enough_gallons(details_json):
             try:
                 accounts = _json.loads(details_json) if isinstance(details_json, str) else details_json
                 if not accounts:
                     return False
-                return any(float(acc.get('spend_last_month', 0)) > min_spend for acc in accounts)
+                total_gallons = sum(float(acc.get('gallons_last_month', 0)) for acc in accounts)
+                return total_gallons >= min_gallons
             except Exception:
                 return False
         
-        before_spend_filter = len(stakeholder_df)
-        stakeholder_df = stakeholder_df[stakeholder_df['ACCOUNT_DETAILS_LIST'].apply(has_enough_spend)].copy()
-        spend_excluded = before_spend_filter - len(stakeholder_df)
-        logger.info(f"Excluded {spend_excluded} orgs due to no accounts exceeding minimum spend threshold of {min_spend}")
+        before_gallons_filter = len(stakeholder_df)
+        stakeholder_df = stakeholder_df[stakeholder_df['ACCOUNT_DETAILS_LIST'].apply(has_enough_gallons)].copy()
+        gallons_excluded = before_gallons_filter - len(stakeholder_df)
+        logger.info(f"Excluded {gallons_excluded} orgs due to total gallons less than threshold of {min_gallons}")
     
     excluded = len(output_df) - len(stakeholder_df)
 
@@ -445,7 +446,7 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--horizon", type=str, default="8M", help="Target horizon model to use for inference")
-    parser.add_argument("--min-spend", type=float, default=1000.0, help="Minimum last month spend for at least one account in stakeholder export")
+    parser.add_argument("--min-gallons", type=float, default=100.0, help="Minimum last month total gallons for stakeholder export")
     args = parser.parse_args()
     
-    predict_latest_snapshot(horizon=args.horizon, min_spend=args.min_spend)
+    predict_latest_snapshot(horizon=args.horizon, min_gallons=args.min_gallons)
