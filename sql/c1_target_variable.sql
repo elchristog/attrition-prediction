@@ -11,22 +11,22 @@ CALENDAR AS (
 ),
 
 -- 2. THE HISTORICAL BRIDGE (With Infinite Retroactivity Patch)
--- This logic solves the MDM stabilization issue by freezing relationships prior to March 2026.
+-- This logic solves the "Day Zero" issue where Reltio history only starts in Oct 2024 and the MDM stabilization issue freezing relationships prior to March 2026.
 ANCHOR_RECORDS AS (
     SELECT 
         ACCOUNT_URI,
         ORGANIZATION_URI AS ORG_URI
     FROM PREP.MDM_RELTIO.f_entity_wxaccountnumber_organization_snapshot
     QUALIFY ROW_NUMBER() OVER (
-        PARTITION BY ACCOUNT_URI 
-        ORDER BY 
-            -- Priority 1: Was active exactly on March 1, 2026
+        PARTITION BY ACCOUNT_URI
+        ORDER BY
+            -- Priority 1: Was active exactly on March 1, 2026 (the date MDM relationships were stabilized)
             CASE WHEN ROW_EFF_BEGIN_DTTM <= '2026-03-01'::DATE AND (ROW_EFF_END_DTTM IS NULL OR ROW_EFF_END_DTTM > '2026-03-01'::DATE) THEN 1 
             -- Priority 2: Started after March 1, 2026 (get the earliest one)
-                 WHEN ROW_EFF_BEGIN_DTTM > '2026-03-01'::DATE THEN 2
+            WHEN ROW_EFF_BEGIN_DTTM > '2026-03-01'::DATE THEN 2
             -- Priority 3: Ended before March 1, 2026 (get the latest one)
-                 ELSE 3 END,
-            CASE WHEN ROW_EFF_BEGIN_DTTM > '2026-03-01'::DATE THEN ROW_EFF_BEGIN_DTTM END ASC,
+            ELSE 3 END,
+            CASE WHEN ROW_EFF_END_DTTM > '2026-03-01'::DATE THEN  ROW_EFF_BEGIN_DTTM END ASC,
             ROW_EFF_BEGIN_DTTM DESC
     ) = 1
 ),
@@ -39,12 +39,12 @@ HISTORICAL_BRIDGE AS (
         snap.ORGANIZATION_URI AS ORG_URI
     FROM CALENDAR c
     JOIN PREP.MDM_RELTIO.f_entity_wxaccountnumber_organization_snapshot snap
-        ON c.OBS_DATE >= '2026-03-01'::DATE
-        AND c.OBS_DATE >= snap.ROW_EFF_BEGIN_DTTM 
-        AND (c.OBS_DATE < snap.ROW_EFF_END_DTTM OR snap.ROW_EFF_END_DTTM IS NULL)
-        
-    UNION ALL
+            ON c.OBS_DATE >= '2026-03-01'::DATE
+            AND c.OBS_DATE >= snap.ROW_EFF_BEGIN_DTTM
+            AND (c.OBS_DATE < snap.ROW_EFF_END_DTTM OR snap.ROW_EFF_END_DTTM IS NULL)
     
+    UNION ALL
+
     -- Retroactive patch for dates BEFORE March 2026
     SELECT 
         c.OBS_DATE,
@@ -208,13 +208,13 @@ ENTITY_TIME_TRAVEL AS (
         COALESCE(AVG(ENT_GALLONS) OVER (PARTITION BY ORG_URI ORDER BY OBS_DATE ROWS BETWEEN 3 PRECEDING AND 1 PRECEDING), 0) AS AVG_GAL_RECENT,
         COALESCE(LAG(ENT_GALLONS, 12) OVER (PARTITION BY ORG_URI ORDER BY OBS_DATE), 0) AS GAL_L12,
 
-        -- LOOK-AHEAD: Maximum volume in the next 4 months to ensure Attrition is a Terminal State
+        -- LOOK-AHEAD: Maximum volume in the next 4 months to ensure Attrition is a Terminal state
         MAX(ENT_GALLONS) OVER (
             PARTITION BY ORG_URI 
             ORDER BY OBS_DATE 
             ROWS BETWEEN 1 FOLLOWING AND 4 FOLLOWING
-        ) AS MAX_GAL_NEXT_4M,
-        
+        ) AS FUTURE_MAX_GAL_4M,
+
         -- Count of future months available (to handle the most recent data correctly)
         COUNT(*) OVER (
             PARTITION BY ORG_URI 
@@ -230,18 +230,18 @@ SILENT_ATTRITION_EVAL AS (
         OBS_DATE,
         
         CASE 
-            -- WAIVER: We waive the 6-month MDM history requirement for dates prior to March 2026 
+            -- WAIVER: We waive the 6-month MDM history requirement for dates before March 2026
             -- to allow the Infinite Retroactivity patch to label the historical training set.
             WHEN MDM_HISTORY_MONTHS_AVAILABLE < 6 AND OBS_DATE >= '2026-03-01'::DATE THEN 0
             
             -- WAIVER: Physical account must have existed for at least 6 months
             WHEN COALESCE(REAL_MAX_TENURE, 0) < 6 THEN 0
             
-            -- PERSISTENCE CHECK: If the entity recovered within the next 4 months, it is NOT attrition.
-            -- We allow a small threshold (5 gallons) to account for data noise/corrections.
-            WHEN FUTURE_MONTHS_AVAILABLE > 0 AND MAX_GAL_NEXT_4M > 5 THEN 0
+            -- SILENT ATTRITION RULES
+            -- PERSISTENCE CHECK: If the entity recovered within the next 4 months, we do not classify as attrition
+            WHEN FUTURE_MONTHS_AVAILABLE >= 0 AND FUTURE_MAX_GAL_4M > 5 THEN 0
 
-            -- SILENT ATTRITION RULES (Only apply if Persistence Check passed)
+            -- SILENT ATTRITION RULES (Only applied if persistence check is passed or future data is not available)
             WHEN ENT_GALLONS = 0 AND GAL_L1 = 0 AND GAL_L2 = 0 AND GAL_L3 = 0 AND GAL_L4 = 0 AND GAL_L5 = 0 THEN 1
             WHEN ENT_ACTIVE_CARDS <= 20 AND ENT_GALLONS = 0 AND GAL_L1 = 0 AND GAL_L2 = 0 AND GAL_L3 > 0  AND ENT_CREDIT_LIMIT <= COALESCE(CL_L3, 0) THEN 1
             WHEN ENT_ACTIVE_CARDS >= 21 AND ENT_GALLONS = 0 AND GAL_L1 = 0 AND GAL_L2 = 0 AND GAL_L3 > 0 AND ENT_CREDIT_LIMIT <= COALESCE(CL_L3, 0) THEN 1

@@ -7,16 +7,15 @@ import logging
 logger = logging.getLogger(__name__)
 
 class AttritionFeatureEngineer:
-    def __init__(self, horizon="6M", attrition_type="HARD"):
+    def __init__(self, horizon="8M", attrition_typr="HARD"):
         self.label_encoders = {}
         self.feature_cols = []
         self.horizon = horizon.upper()
-        self.attrition_type = attrition_type.upper()
+        self.attrition_type = attrition_typr.upper()
         if self.attrition_type in ["HARD", "SILENT"]:
             self.target_col = f"TARGET_{self.attrition_type}_{self.horizon}"
         else:
             self.target_col = f"TARGET_{self.horizon}"
-
         
     def preprocess_data(self, df, is_training=True):
         """
@@ -39,7 +38,7 @@ class AttritionFeatureEngineer:
         # Shubhi's recommendations for Seasonality and Behavioral signals
         base_features = [
             'SPEND_L3M_VS_BLENDED_RATIO',
-            'CONSECUTIVE_INACTIVE_MONTHS',
+            # 'CONSECUTIVE_INACTIVE_MONTHS',
             'DECLINED_TXN_RATE_L6M',
             'ACTIVE_MONTHS_RATE_L12M',
             'FEE_TO_REVENUE_RATIO_MTH',
@@ -50,42 +49,57 @@ class AttritionFeatureEngineer:
             'ENT_CASE_TOTAL_LAG2',
             'ENT_FEES_LAG1'
         ]
-        
+
         # Modify these lists to define distinct feature sets for each model type
         if self.attrition_type == "HARD":
             selected_features = [
-                'SPEND_L3M_VS_BLENDED_RATIO',
-                'DECLINED_TXN_RATE_L6M',
-                'ACTIVE_MONTHS_RATE_L12M',
-                'FEE_TO_REVENUE_RATIO_MTH',
-                'ENT_GALLONS_VELOCITY_3V12',
-                'IS_TRUCKING_INDUSTRY',
-                'ACCOUNT_COUNT',
-                'ENT_CASE_TOTAL_LAG2',
-                'ENT_FEES_LAG1',
-                'IS_SMALL_BIZ'
-            ]
+            'SPEND_L3M_VS_BLENDED_RATIO',
+            'DECLINED_TXN_RATE_L6M',
+            'DECLINED_TXN_RATE_MTH',           # current-month spike: immediate driver friction
+            'ACTIVE_MONTHS_RATE_L12M',
+            'FEE_TO_REVENUE_RATIO_MTH',
+            'FEE_RATIO_TREND_3M',
+            'ENT_GALLONS_VELOCITY_3V12',
+            'IS_TRUCKING_INDUSTRY',
+            'ACCOUNT_COUNT',
+            'ENT_CASE_TOTAL_LAG2',
+            'ENT_CASE_TREND_3M',
+            'ENT_CASE_PER_1K_GALLONS',
+            'MONTHS_SINCE_CS_TERMINATION_CASE', # recency of formal termination case in CRM
+            'ENT_FEES_LAG1',
+            'CURRENT_VOLUME_VS_PEAK_PCT',
+            'IS_SMALL_BIZ'
+        ]
         elif self.attrition_type == "SILENT":
             selected_features = [
-                'SPEND_L3M_VS_BLENDED_RATIO',
-                'DECLINED_TXN_RATE_L6M',
-                'ACTIVE_MONTHS_RATE_L12M',
-                'FEE_TO_REVENUE_RATIO_MTH_LAG1', # Use the lagged fee ratio for silent attrition
-                'ENT_GALLONS_VELOCITY_3V12',
-                'IS_TRUCKING_INDUSTRY',
-                'ACCOUNT_COUNT',
-                'ENT_CASE_TOTAL_LAG2',
-                'ENT_FEES_LAG1', # lag to capture earlier behavioral signals for silent attrition
-                'HISTORICAL_MAX_DROP_PCT',
-                'IS_SMALL_BIZ',
-                'ENT_GALLONS_AVG_3M'
-            ]
-        else:
-            selected_features = base_features.copy()
-
+            'SPEND_L3M_VS_BLENDED_RATIO',
+            'DECLINED_TXN_RATE_L6M',
+            'DECLINED_TXN_RATE_MTH',           # current-month spike: immediate driver friction
+            'ACTIVE_MONTHS_RATE_L12M',
+            'FEE_TO_REVENUE_RATIO_MTH_LAG1',
+            'FEE_RATIO_TREND_3M',
+            'ENT_GALLONS_VELOCITY_3V12',
+            'ENT_GALLONS_VELOCITY_YOY',
+            'IS_TRUCKING_INDUSTRY',
+            'ACCOUNT_COUNT',
+            'ENT_CASE_TOTAL_LAG2',
+            'ENT_CASE_TREND_3M',
+            'ENT_CASE_PER_1K_GALLONS',
+            'MONTHS_SINCE_CS_TERMINATION_CASE', # recency of formal termination case in CRM
+            'ENT_FEES_LAG1',
+            'HISTORICAL_MAX_DROP_PCT',
+            'CURRENT_VOLUME_VS_PEAK_PCT',
+            'IS_SMALL_BIZ',
+            'ENT_GALLONS_AVG_3M'
+        ]
+        else:  # General Attrition
+            selected_features = base_features.copy()  # Start with base features for general attrition
         
-        # Apply history exclusion flags (Clean population for seasonality)
-        if 'EXCL_FLAG_HIST_15M' in df.columns:
+        # Apply history exclusion flags only during training.
+        # During inference we score all active accounts regardless of history length —
+        # immature features get median-imputed below. Excluding them at scoring time
+        # would silently drop new accounts that may be at real attrition risk.
+        if is_training and 'EXCL_FLAG_HIST_15M' in df.columns:
             df = df[df['EXCL_FLAG_HIST_15M'] == 0]
             logger.info(f"Filtered by EXCL_FLAG_HIST_15M. Remaining rows: {len(df)}")
         # We also need to extract the target column before subsetting
@@ -121,15 +135,17 @@ class AttritionFeatureEngineer:
         else:
             return features[self.feature_cols]
 
+
 if __name__ == "__main__":
     # Example usage (Mock data)
-    fe = AttritionFeatureEngineer(attrition_type="HARD")
+    fe = AttritionFeatureEngineer(horizon="8M", attrition_typr="HARD")
     # Mock DF
     data = pd.DataFrame({
         "ORG_URI": ["A", "B"],
         "ENT_GALLONS": [100, 200],
         "PARTNER_IND": ["Wex", "Partner"],
-        "TARGET_HARD_6M": [0, 1]
+        "TARGET_8M": [0, 1],
+        "TARGET_HARD_8M": [0, 1],
     })
     X, y = fe.preprocess_data(data)
     print(X.head())

@@ -104,15 +104,15 @@ def lift_chart_plot(plot_name: str, decile_df: pd.DataFrame, x_axis: str):
 def generate_and_plot_lift_chart(y_true, y_proba, title, horizon):
     """ Helper to calculate deciles and call lift_chart_plot """
     results = pd.DataFrame({'y_true': y_true, 'proba': y_proba})
-    # Filter out any NaNs in target if they exist
+    # Filter out any NANs in target if they exist
     results = results.dropna(subset=['y_true'])
     if len(results) == 0:
-        logger.warning(f"Skipping lift chart for {title}: No data.")
+        logger.warning(f"No valid data points for lift chart generation for horizon {horizon}. Skipping lift chart.")
         return
-
+    
     results['prob_rank'] = results['proba'].rank(method='first', ascending=True)
     results['decile'] = pd.qcut(results['prob_rank'], 10, labels=False, duplicates='drop')
-    
+
     decile_df = results.groupby('decile').agg(
         COUNT=('y_true', 'size'),
         DEFAULT_RATE=('y_true', 'mean'),
@@ -120,11 +120,11 @@ def generate_and_plot_lift_chart(y_true, y_proba, title, horizon):
         MIN_PROB=('proba', 'min'),
         MAX_PROB=('proba', 'max')
     ).reset_index(drop=True)
-    
+
     decile_df['TOTAL_EVENT_RATE'] = results['y_true'].mean()
     decile_df['prob_range'] = decile_df.apply(lambda row: f"[{row['MIN_PROB']:.5f} - {row['MAX_PROB']:.5f}]", axis=1)
-    
-    lift_chart_plot(f"{title} - Horizon {horizon}", decile_df, "prob_range")
+
+    lift_chart_plot(title, decile_df, "prob_range")
 
 def plot_importance(importance_df, title, filename, output_dir):
     """ Helper to plot feature importance """
@@ -141,8 +141,7 @@ def train_attrition_model(horizon="8M", attrition_type="HARD", exclude_csv=None)
     End-to-end model training pipeline for a specific churn horizon and attrition type.
     """
     horizon = horizon.upper()
-    attrition_type = attrition_type.upper()
-    logger.info(f"Starting training pipeline for {horizon} horizon, {attrition_type} attrition...")
+    logger.info(f"Starting training pipeline for {horizon} horizon, attrition type: {attrition_type} attrition...")
     
     # 1. Load Data
     session = get_snowpark_session()
@@ -167,61 +166,59 @@ def train_attrition_model(horizon="8M", attrition_type="HARD", exclude_csv=None)
     df = snowpark_df.to_pandas()
     session.close()
 
-    # 1.2 Apply temporary exclusion list if provided
+    # 1.1 Apply temporary exclusion from CSV if provided
     if exclude_csv and os.path.exists(exclude_csv):
         try:
             exclude_df = pd.read_csv(exclude_csv)
             if 'ORG_URI' in exclude_df.columns:
-                orgs_to_exclude = exclude_df['ORG_URI'].unique()
-                initial_df_len = len(df)
-                df = df[~df['ORG_URI'].isin(orgs_to_exclude)]
-                logger.info(f"Temporary Exclusion Filtering: Removed {initial_df_len - len(df)} rows corresponding to {len(orgs_to_exclude)} excluded ORG_URIs.")
+                exclude_orgs = set(exclude_df['ORG_URI'])
+                pre_exclusion_len = len(df)
+                df = df[~df['ORG_URI'].isin(exclude_orgs)]
+                logger.info(f"Applied additional exclusion from {exclude_csv}: Removed {pre_exclusion_len - len(df)} rows.")
             else:
-                logger.warning(f"Could not find 'ORG_URI' column in {exclude_csv}. Skipping temporary exclusion.")
+                logger.warning(f"Exclusion CSV {exclude_csv} does not contain 'ORG_URI' column. Skipping additional exclusion.")
         except Exception as e:
-            logger.error(f"Error loading exclusion CSV {exclude_csv}: {e}")
+            logger.error(f"Error reading exclusion CSV {exclude_csv}: {e}. Skipping additional exclusion.")
 
     # 2. Feature Engineering
-    fe = feature_engineering.AttritionFeatureEngineer(horizon=horizon, attrition_type=attrition_type)
+    fe = feature_engineering.AttritionFeatureEngineer(horizon=horizon, attrition_typr=attrition_type)
     X, y = fe.preprocess_data(df)
     
-    # Filter out any instances where target is NaN (if applicable)
+    # Filter out any instances where target is NAN after preprocessing (if any)
     valid_target_mask = pd.notna(y)
     X = X[valid_target_mask]
     y = y[valid_target_mask]
-    
-    # 3. Group-level Train/Test Split (stratified by whether the org ever had attrition)
-    # We use ORG_URI to ensure all history of an entity goes to either train or test
-    org_uri_series = df.loc[X.index, 'ORG_URI']
-    
-    # Group by ORG_URI and find if they ever had attrition (max target)
+
+    # 3. Group-level Train-Test Split
+    org_uri_series = df.loc[X.index, 'ORG_URI']  # Ensure alignment with X after preprocessing filtering
+
+    # Group by ORG_URI and find if they ever has attrition event in the target horizon
     org_df = pd.DataFrame({'ORG_URI': org_uri_series.values, 'TARGET': y}, index=X.index)
-    org_attrition = org_df.groupby('ORG_URI')['TARGET'].max()
-    
-    # Attempt stratified split, fallback to simple random split of organizations if it fails
+    org_attrition = org_df.groupby('ORG_URI')['TARGET'].max().reset_index()
+
+    # Attempt stratified split at the org level
     try:
         train_orgs, test_orgs = train_test_split(
-            org_attrition.index, 
+            org_attrition['ORG_URI'], 
             test_size=0.2, 
             random_state=42, 
-            stratify=org_attrition.values
+            stratify=org_attrition['TARGET']
         )
     except ValueError as e:
-        logger.warning(f"Stratified split failed due to class imbalance: {e}. Falling back to simple group-level split.")
+        logger.warning(f"Stratified split failed: {e}. Proceeding with random split without stratification.")
         train_orgs, test_orgs = train_test_split(
-            org_attrition.index, 
+            org_attrition['ORG_URI'], 
             test_size=0.2, 
-            random_state=42, 
-            stratify=None
+            random_state=42
         )
-    
+
     # Create train and test masks for the rows
     train_mask = org_df['ORG_URI'].isin(train_orgs)
     test_mask = org_df['ORG_URI'].isin(test_orgs)
-    
+
     X_train, X_test = X[train_mask], X[test_mask]
-    y_train, y_test = y[train_mask.values], y[test_mask.values]
-    
+    y_train, y_test = y[train_mask], y[test_mask]
+
     # 4. Model Training
     logger.info("Training LightGBM model...")
     model = LGBMClassifier(
@@ -242,36 +239,39 @@ def train_attrition_model(horizon="8M", attrition_type="HARD", exclude_csv=None)
     auc_roc = roc_auc_score(y_test, y_proba)
     auc_pr = average_precision_score(y_test, y_proba)
     
-    logger.info(f"Model Results [{attrition_type}]: AUC-ROC: {auc_roc:.4f}, PR-AUC: {auc_pr:.4f}")
+
+    logger.info(f"Model Results [{attrition_type} Attrition, Horizon: {horizon}]: AUC-ROC = {auc_roc:.4f}, AUC-PR = {auc_pr:.4f}")
     logger.info("\n" + classification_report(y_test, y_pred))
     
-    # 6. Decile Analysis / Lift Charts
-    logger.info("Generating Lift Charts...")
+    # 6. Decile Analysis / Lift Chart
+    logger.info("Generating lift chart...")
     output_data_dir = os.environ.get('SM_OUTPUT_DATA_DIR', 'attrition_pipeline/artifacts')
     os.makedirs(output_data_dir, exist_ok=True)
 
-    generate_and_plot_lift_chart(y_test, y_proba, f"{attrition_type} Model", horizon)
-    
-    # 7. Save Model Artifacts
+    generate_and_plot_lift_chart(y_test, y_proba, title=f"{attrition_type} Attrition Lift Chart - {horizon}", horizon=horizon)
+
+    # 7. Save Artifacts
+    # SageMaker paths
     model_dir = os.environ.get('SM_MODEL_DIR', 'attrition_pipeline/artifacts')
+    
     os.makedirs(model_dir, exist_ok=True)
     
     with open(os.path.join(model_dir, f"model_{attrition_type}.pkl"), "wb") as f:
         pickle.dump(model, f)
+        
     with open(os.path.join(model_dir, f"feature_engineer_{attrition_type}.pkl"), "wb") as f:
         pickle.dump(fe, f)
+        
     logger.info(f"Saved model and feature engineer to {model_dir}")
     
-    # 8. Feature Importance Analysis
-    logger.info("Generating Feature Importance Plots...")
-    
-    # 8.1 Global Importance (Model Based)
+    # 8. Feature Importance Plot
     importance_df = pd.DataFrame({
         'feature': X.columns,
         'importance': model.feature_importances_
     }).sort_values(by='importance', ascending=False)
     
-    plot_importance(importance_df, f"Feature Importance - {attrition_type} ({horizon})", f"feature_importance_{attrition_type}.png", output_data_dir)
+    plot_importance(importance_df, title=f"Feature Importance - {horizon}", filename=f"Feature_Importance_{attrition_type}_{horizon}.png", output_dir=output_data_dir)
+
 
 def train_all_models(horizon="8M", exclude_csv=None):
     train_attrition_model(horizon=horizon, attrition_type="HARD", exclude_csv=exclude_csv)
@@ -281,7 +281,6 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--horizon", type=str, default="8M", help="Target horizon (3M, 6M, 8M, 12M)")
-    parser.add_argument("--exclude_csv", type=str, default=None, help="Path to CSV containing ORG_URIs to exclude (temporary fix)")
     args = parser.parse_args()
     
     train_all_models(horizon=args.horizon, exclude_csv=args.exclude_csv)

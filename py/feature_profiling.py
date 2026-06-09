@@ -151,9 +151,9 @@ class MultiHorizonProfiler:
 
         results = []
         for target in self.targets:
-            # Extract horizon (e.g. 8M) even if target is TARGET_HARD_8M or TARGET_SILENT_8M
             import re
-            match = re.search(r'(\d+M)', target)
+            # Extract horizon (e.g. 8M) even if target is TARGET_HARD_8M or TARGET_SILENT_8M
+            match = re.search(r'_(\d+M)', target)
             hz_suffix = match.group(1) if match else "8M"
             excl_flag = f"EXCL_FLAG_3_{hz_suffix}"
             
