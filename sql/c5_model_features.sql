@@ -222,7 +222,13 @@ SELECT
     ((r.ENT_FEES / NULLIF(r.ENT_REVENUE, 0)) - r.fee_ratio_avg_3_5m)  AS FEE_RATIO_TREND_3M,
     -- Current volume as a fraction of the entity's all-time historical peak gallons.
     -- <1.0 means the entity has not recovered to peak; <0.75 signals meaningful decline.
-    (r.ent_gallons_avg_3m / NULLIF(r.ent_gallons_hist_peak, 0))        AS CURRENT_VOLUME_VS_PEAK_PCT
+    (r.ent_gallons_avg_3m / NULLIF(r.ent_gallons_hist_peak, 0))        AS CURRENT_VOLUME_VS_PEAK_PCT,
+    CASE 
+        WHEN COALESCE(r.ent_fleet_cards, 0) BETWEEN 1 AND 9 THEN 'Micro & Small'
+        WHEN COALESCE(r.ent_fleet_cards, 0) BETWEEN 10 AND 250 THEN 'Mid Market'
+        WHEN COALESCE(r.ent_fleet_cards, 0) > 250 THEN 'Enterprise'
+        ELSE 'Unknown'
+    END AS FLEET_SEGMENT
 FROM rolling r
 LEFT JOIN entity_history eh
     ON eh.ORG_URI = r.ORG_URI AND eh.cohort_month = r.cohort_month

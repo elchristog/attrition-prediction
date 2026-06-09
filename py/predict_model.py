@@ -321,8 +321,8 @@ def predict_latest_snapshot(horizon="8M", min_gallons=100.0):
 
     # 4b. Compute TreeSHAP reason codes for both models
     logger.info("Computing TreeSHAP reason codes for HARD and SILENT models...")
-    shap_hard_df = _compute_shap_reason_codes(model_hard, X_pred_hard, prefix="HARD", top_n=3)
-    shap_silent_df = _compute_shap_reason_codes(model_silent, X_pred_silent, prefix="SILENT", top_n=3)
+    shap_hard_df = _compute_shap_reason_codes(model_hard, X_pred_hard, prefix="HARD", top_n=4)
+    shap_silent_df = _compute_shap_reason_codes(model_silent, X_pred_silent, prefix="SILENT", top_n=4)
     # Reindex to df's canonical index to handle any row-set differences between feature engineers
     shap_hard_df = shap_hard_df.reindex(df.index)
     shap_silent_df = shap_silent_df.reindex(df.index)
@@ -334,6 +334,8 @@ def predict_latest_snapshot(horizon="8M", min_gallons=100.0):
         cols_to_keep.append('ACCOUNT_COUNT')
     if 'STATUS_ACTIVE_COUNT' in df.columns:
         cols_to_keep.append('STATUS_ACTIVE_COUNT')
+    if 'FLEET_SEGMENT' in df.columns:
+        cols_to_keep.append('FLEET_SEGMENT')
         
     # Enrich account objects (from C3's ARRAY_AGG(OBJECT_CONSTRUCT)) with today's risk eligibility
     if 'ACCOUNT_ID_LIST' in df.columns:
@@ -570,9 +572,25 @@ def predict_latest_snapshot(horizon="8M", min_gallons=100.0):
         lambda r: r['HARD_REASON_3'] if r['DOMINANT_ATTRITION_TYPE'] == 'HARD' else r['SILENT_REASON_3'],
         axis=1,
     )
-    # Content strategy cluster for the primary driver — maps directly to Green/Red/Blue/Orange
+    output_df['QUATERNARY_ATTRITION_REASON'] = output_df.apply(
+        lambda r: r['HARD_REASON_4'] if r['DOMINANT_ATTRITION_TYPE'] == 'HARD' else r['SILENT_REASON_4'],
+        axis=1,
+    )
+    # Content strategy clusters for the primary, secondary, tertiary, and quaternary drivers
     output_df['PRIMARY_ATTRITION_CATEGORY'] = output_df.apply(
         lambda r: r['HARD_REASON_1_CATEGORY'] if r['DOMINANT_ATTRITION_TYPE'] == 'HARD' else r['SILENT_REASON_1_CATEGORY'],
+        axis=1,
+    )
+    output_df['SECONDARY_ATTRITION_CATEGORY'] = output_df.apply(
+        lambda r: r['HARD_REASON_2_CATEGORY'] if r['DOMINANT_ATTRITION_TYPE'] == 'HARD' else r['SILENT_REASON_2_CATEGORY'],
+        axis=1,
+    )
+    output_df['TERTIARY_ATTRITION_CATEGORY'] = output_df.apply(
+        lambda r: r['HARD_REASON_3_CATEGORY'] if r['DOMINANT_ATTRITION_TYPE'] == 'HARD' else r['SILENT_REASON_3_CATEGORY'],
+        axis=1,
+    )
+    output_df['QUATERNARY_ATTRITION_CATEGORY'] = output_df.apply(
+        lambda r: r['HARD_REASON_4_CATEGORY'] if r['DOMINANT_ATTRITION_TYPE'] == 'HARD' else r['SILENT_REASON_4_CATEGORY'],
         axis=1,
     )
 

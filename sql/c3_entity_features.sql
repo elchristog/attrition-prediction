@@ -126,7 +126,8 @@ entity_monthly_snapshot AS (
         SUM(TOTAL_EXPOSURE_MTH)   AS ent_exposure,
         
         -- Count of active accounts
-        SUM(is_active_month)      AS active_account_count
+        SUM(is_active_month)      AS active_account_count,
+        SUM(outstanding_cardcount_mth) AS ent_fleet_cards
 
     FROM entity_account_base
     GROUP BY 1, 2
