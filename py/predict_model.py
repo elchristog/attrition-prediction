@@ -336,6 +336,43 @@ def predict_latest_snapshot(horizon="8M", min_gallons=100.0):
         cols_to_keep.append('STATUS_ACTIVE_COUNT')
     if 'FLEET_SEGMENT' in df.columns:
         cols_to_keep.append('FLEET_SEGMENT')
+    else:
+        logger.info("FLEET_SEGMENT not found in ML_Model_Features_C5 columns. Calculating on the fly from Account_ID_features_monthly...")
+        try:
+            # Query outstanding_cardcount_mth per org_uri for the latest cohort matching C3 logic
+            cards_df = session.sql(f"""
+                SELECT snap.organization_uri AS org_uri, SUM(af.outstanding_cardcount_mth) AS ent_fleet_cards
+                FROM WORKSPACE.digitalda_stage.Account_ID_features_monthly af
+                JOIN PREP.MDM_RELTIO.entity_wxaccountnumber wx ON af.account_id = wx.accountnumber
+                JOIN PREP.MDM_RELTIO.f_entity_wxaccountnumber_organization_snapshot snap ON wx.uri = snap.account_uri
+                WHERE af.cohort_month = '{latest_cohort_str}'
+                  AND af.cohort_month >= snap.row_eff_begin_dttm
+                  AND (af.cohort_month < snap.row_eff_end_dttm OR snap.row_eff_end_dttm IS NULL)
+                GROUP BY 1
+            """).to_pandas()
+            cards_df.columns = [c.upper() for c in cards_df.columns]
+            
+            def get_segment(cards):
+                try:
+                    c_val = float(cards)
+                    if c_val >= 1 and c_val <= 9:
+                        return 'Micro & Small'
+                    elif c_val >= 10 and c_val <= 250:
+                        return 'Mid Market'
+                    elif c_val > 250:
+                        return 'Enterprise'
+                    else:
+                        return 'Unknown'
+                except Exception:
+                    return 'Unknown'
+                    
+            cards_df['FLEET_SEGMENT'] = cards_df['ENT_FLEET_CARDS'].apply(get_segment)
+            segment_map = dict(zip(cards_df['ORG_URI'], cards_df['FLEET_SEGMENT']))
+            df['FLEET_SEGMENT'] = df['ORG_URI'].map(segment_map).fillna('Unknown')
+        except Exception as e:
+            logger.warning(f"Could not calculate FLEET_SEGMENT on the fly: {e}")
+            df['FLEET_SEGMENT'] = 'Unknown'
+        cols_to_keep.append('FLEET_SEGMENT')
         
     # Enrich account objects (from C3's ARRAY_AGG(OBJECT_CONSTRUCT)) with today's risk eligibility
     if 'ACCOUNT_ID_LIST' in df.columns:
