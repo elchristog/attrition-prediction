@@ -699,6 +699,59 @@ def predict_latest_snapshot(horizon="8M", min_gallons=100.0):
         f"Saved {len(stakeholder_df)} predictions (stakeholders, {excluded} orgs excluded) to: {stakeholder_path}"
     )
 
+    # Generate segment risk matrices
+    matrix_path = os.path.join(output_data_dir, f"segment_risk_matrices_{horizon}.csv")
+    logger.info(f"Generating segment risk matrices at: {matrix_path}")
+    
+    categories = ["Fuel Volume / Purchasing", "Fee Related", "Declines at Pump", "Customer Service"]
+    observed_cats = set(categories)
+    if 'PRIMARY_ATTRITION_CATEGORY' in stakeholder_df.columns:
+        observed_cats.update(stakeholder_df['PRIMARY_ATTRITION_CATEGORY'].dropna().unique())
+    if 'SECONDARY_ATTRITION_CATEGORY' in stakeholder_df.columns:
+        observed_cats.update(stakeholder_df['SECONDARY_ATTRITION_CATEGORY'].dropna().unique())
+        
+    all_cats = sorted(list(observed_cats), key=lambda x: categories.index(x) if x in categories else 99)
+    columns_multi = pd.MultiIndex.from_product(
+        [all_cats, all_cats],
+        names=['PRIMARY_CATEGORY', 'SECONDARY_CATEGORY']
+    )
+    
+    segments = {
+        "Micro": "Micro & Small",
+        "Mid Market": "Mid Market",
+        "Enterprise": "Enterprise"
+    }
+    
+    try:
+        with open(matrix_path, 'w') as f:
+            for seg_name, label in segments.items():
+                f.write(f"=== FLEET SEGMENT: {seg_name} ({label}) ===\n")
+                if 'FLEET_SEGMENT' in stakeholder_df.columns:
+                    seg_df = stakeholder_df[
+                        (stakeholder_df['FLEET_SEGMENT'] == label) | 
+                        (stakeholder_df['FLEET_SEGMENT'].str.lower() == label.lower())
+                    ]
+                else:
+                    seg_df = pd.DataFrame()
+                    
+                if len(seg_df) > 0 and 'RISK_TIER' in seg_df.columns and 'PRIMARY_ATTRITION_CATEGORY' in seg_df.columns and 'SECONDARY_ATTRITION_CATEGORY' in seg_df.columns:
+                    ct = pd.crosstab(
+                        index=seg_df['RISK_TIER'],
+                        columns=[seg_df['PRIMARY_ATTRITION_CATEGORY'], seg_df['SECONDARY_ATTRITION_CATEGORY']],
+                        dropna=False
+                    )
+                    ct = ct.reindex(index=[1, 2, 3], columns=columns_multi, fill_value=0)
+                else:
+                    ct = pd.DataFrame(0, index=[1, 2, 3], columns=columns_multi)
+                
+                ct.to_csv(f)
+                f.write("\n\n")
+                
+                logger.info(f"Generated matrix for segment: {seg_name} ({len(seg_df)} entities)")
+        logger.info(f"Saved segment risk matrices successfully to: {matrix_path}")
+    except Exception as e:
+        logger.error(f"Failed to generate segment risk matrices: {e}")
+
     # 6. Export Stakeholders Table to Snowflake
     target_table = "WORKSPACE.digitalda_stage.ATTRITION_STAKEHOLDER_PREDICTIONS"
     logger.info(f"Exporting stakeholder predictions to Snowflake table: {target_table}...")
