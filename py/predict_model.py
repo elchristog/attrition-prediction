@@ -744,7 +744,8 @@ def predict_latest_snapshot(horizon="8M", min_gallons=100.0):
                 else:
                     ct = pd.DataFrame(0, index=[1, 2, 3], columns=columns_multi)
                 
-                ct.to_csv(f)
+                csv_str = ct.to_csv()
+                f.write(csv_str)
                 f.write("\n\n")
                 
                 logger.info(f"Generated matrix for segment: {seg_name} ({len(seg_df)} entities)")
