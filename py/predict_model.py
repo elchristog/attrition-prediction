@@ -725,33 +725,49 @@ def predict_latest_snapshot(horizon="8M", min_gallons=100.0):
     try:
         with open(matrix_path, 'w') as f:
             for seg_name, label in segments.items():
+                logger.info(f"Processing segment: {seg_name} ({label})")
                 f.write(f"=== FLEET SEGMENT: {seg_name} ({label}) ===\n")
-                if 'FLEET_SEGMENT' in stakeholder_df.columns:
-                    seg_df = stakeholder_df[
-                        (stakeholder_df['FLEET_SEGMENT'] == label) | 
-                        (stakeholder_df['FLEET_SEGMENT'].str.lower() == label.lower())
-                    ]
-                else:
-                    seg_df = pd.DataFrame()
+                
+                try:
+                    if 'FLEET_SEGMENT' in stakeholder_df.columns:
+                        # Case-insensitive substring match to be robust to NaNs and different naming conventions
+                        if seg_name == "Micro":
+                            mask = stakeholder_df['FLEET_SEGMENT'].str.lower().str.contains('micro|small', na=False)
+                        elif seg_name == "Mid Market":
+                            mask = stakeholder_df['FLEET_SEGMENT'].str.lower().str.contains('mid', na=False)
+                        elif seg_name == "Enterprise":
+                            mask = stakeholder_df['FLEET_SEGMENT'].str.lower().str.contains('enterprise', na=False)
+                        else:
+                            mask = pd.Series(False, index=stakeholder_df.index)
+                        seg_df = stakeholder_df[mask]
+                    else:
+                        logger.warning(f"'FLEET_SEGMENT' column not found in stakeholder_df. Columns are: {list(stakeholder_df.columns)}")
+                        seg_df = pd.DataFrame()
+                        
+                    logger.info(f"Segment '{seg_name}' has {len(seg_df)} matching rows")
                     
-                if len(seg_df) > 0 and 'RISK_TIER' in seg_df.columns and 'PRIMARY_ATTRITION_CATEGORY' in seg_df.columns and 'SECONDARY_ATTRITION_CATEGORY' in seg_df.columns:
-                    ct = pd.crosstab(
-                        index=seg_df['RISK_TIER'],
-                        columns=[seg_df['PRIMARY_ATTRITION_CATEGORY'], seg_df['SECONDARY_ATTRITION_CATEGORY']],
-                        dropna=False
-                    )
-                    ct = ct.reindex(index=[1, 2, 3], columns=columns_multi, fill_value=0)
-                else:
-                    ct = pd.DataFrame(0, index=[1, 2, 3], columns=columns_multi)
-                
-                csv_str = ct.to_csv()
-                f.write(csv_str)
-                f.write("\n\n")
-                
-                logger.info(f"Generated matrix for segment: {seg_name} ({len(seg_df)} entities)")
+                    if len(seg_df) > 0 and 'RISK_TIER' in seg_df.columns and 'PRIMARY_ATTRITION_CATEGORY' in seg_df.columns and 'SECONDARY_ATTRITION_CATEGORY' in seg_df.columns:
+                        ct = pd.crosstab(
+                            index=seg_df['RISK_TIER'],
+                            columns=[seg_df['PRIMARY_ATTRITION_CATEGORY'], seg_df['SECONDARY_ATTRITION_CATEGORY']],
+                            dropna=False
+                        )
+                        ct = ct.reindex(index=[1, 2, 3], columns=columns_multi, fill_value=0)
+                    else:
+                        logger.info(f"Creating empty matrix for {seg_name} (rows={len(seg_df)})")
+                        ct = pd.DataFrame(0, index=[1, 2, 3], columns=columns_multi)
+                    
+                    csv_str = ct.to_csv()
+                    f.write(csv_str)
+                    f.write("\n\n")
+                    logger.info(f"Successfully wrote matrix for segment: {seg_name}")
+                except Exception as seg_err:
+                    logger.error(f"Error generating matrix for segment {seg_name}: {seg_err}")
+                    f.write(f"ERROR: Failed to generate matrix for {seg_name}: {seg_err}\n\n")
+                    
         logger.info(f"Saved segment risk matrices successfully to: {matrix_path}")
     except Exception as e:
-        logger.error(f"Failed to generate segment risk matrices: {e}")
+        logger.error(f"Failed to open/write to segment risk matrices file: {e}")
 
     # 6. Export Stakeholders Table to Snowflake
     target_table = "WORKSPACE.digitalda_stage.ATTRITION_STAKEHOLDER_PREDICTIONS"
