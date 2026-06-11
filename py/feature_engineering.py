@@ -68,7 +68,12 @@ class AttritionFeatureEngineer:
             'MONTHS_SINCE_CS_TERMINATION_CASE', # recency of formal termination case in CRM
             'ENT_FEES_LAG1',
             'CURRENT_VOLUME_VS_PEAK_PCT',
-            'IS_SMALL_BIZ'
+            'IS_SMALL_BIZ',
+            'COUNT_TOTAL_CALLS_30D',
+            'COUNT_POOR_SENTIMENT_CALLS_30D',
+            'AVG_SENTIMENT_SCORE_90D',
+            'SENTIMENT_DELTA_VARIANCE',
+            'HAS_CONTACTED_30D'
         ]
         elif self.attrition_type == "SILENT":
             selected_features = [
@@ -90,7 +95,12 @@ class AttritionFeatureEngineer:
             'HISTORICAL_MAX_DROP_PCT',
             'CURRENT_VOLUME_VS_PEAK_PCT',
             'IS_SMALL_BIZ',
-            'ENT_GALLONS_AVG_3M'
+            'ENT_GALLONS_AVG_3M',
+            'COUNT_TOTAL_CALLS_30D',
+            'COUNT_POOR_SENTIMENT_CALLS_30D',
+            'AVG_SENTIMENT_SCORE_90D',
+            'SENTIMENT_DELTA_VARIANCE',
+            'HAS_CONTACTED_30D'
         ]
         else:  # General Attrition
             selected_features = base_features.copy()  # Start with base features for general attrition

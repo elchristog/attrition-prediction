@@ -30,6 +30,9 @@ if __name__ == 'main':
         # Run C3
         run_sql_file(session, os.path.join(sql_dir, 'c3_entity_features.sql'))
         
+        # Run C7 (Entity Sentiment Features)
+        run_sql_file(session, os.path.join(sql_dir, 'c7_sentiment_features.sql'))
+        
         # Run C4 (regenerate master table with new features)
         run_sql_file(session, os.path.join(sql_dir, 'c4_target_table.sql'))
 

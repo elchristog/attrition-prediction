@@ -92,6 +92,11 @@ REASON_CODE_CATEGORY = {
     "ENT_CASE_TREND_3M":                 "Customer Service",
     "ENT_CASE_PER_1K_GALLONS":           "Customer Service",
     "MONTHS_SINCE_CS_TERMINATION_CASE":  "Customer Service",
+    "COUNT_TOTAL_CALLS_30D":             "Customer Service",
+    "COUNT_POOR_SENTIMENT_CALLS_30D":    "Customer Service",
+    "AVG_SENTIMENT_SCORE_90D":           "Customer Service",
+    "SENTIMENT_DELTA_VARIANCE":          "Customer Service",
+    "HAS_CONTACTED_30D":                 "Customer Service",
 }
 
 ATTRITION_REASON_LABELS = {
@@ -115,6 +120,11 @@ ATTRITION_REASON_LABELS = {
     "CURRENT_VOLUME_VS_PEAK_PCT":    "Volume Well Below Historical Peak",
     "DECLINED_TXN_RATE_MTH":         "Real-time Fuel Card Declined Spike",
     "MONTHS_SINCE_CS_TERMINATION_CASE": "Recent Customer Service Attrition Case",
+    "COUNT_TOTAL_CALLS_30D":          "High Support Call Volume (30 Days)",
+    "COUNT_POOR_SENTIMENT_CALLS_30D": "Recent Support Interactions with Poor Customer Sentiment",
+    "AVG_SENTIMENT_SCORE_90D":        "Low Rolling Customer Sentiment Score (90 Days)",
+    "SENTIMENT_DELTA_VARIANCE":       "Recent Decline in Customer Sentiment Trend",
+    "HAS_CONTACTED_30D":              "Recent Support Center Contact",
 }
 
 

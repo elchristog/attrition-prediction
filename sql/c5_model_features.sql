@@ -228,7 +228,12 @@ SELECT
         WHEN COALESCE(r.ent_fleet_cards, 0) BETWEEN 10 AND 250 THEN 'Mid Market'
         WHEN COALESCE(r.ent_fleet_cards, 0) > 250 THEN 'Enterprise'
         ELSE 'Unknown'
-    END AS FLEET_SEGMENT
+    END AS FLEET_SEGMENT,
+    s.COUNT_TOTAL_CALLS_30D AS COUNT_TOTAL_CALLS_30D,
+    s.COUNT_POOR_SENTIMENT_CALLS_30D AS COUNT_POOR_SENTIMENT_CALLS_30D,
+    s.AVG_SENTIMENT_SCORE_90D AS AVG_SENTIMENT_SCORE_90D,
+    s.SENTIMENT_DELTA_VARIANCE AS SENTIMENT_DELTA_VARIANCE,
+    s.HAS_CONTACTED_30D AS HAS_CONTACTED_30D
 FROM rolling r
 LEFT JOIN entity_history eh
     ON eh.ORG_URI = r.ORG_URI AND eh.cohort_month = r.cohort_month
@@ -238,4 +243,6 @@ LEFT JOIN streak_final sf
     ON sf.ORG_URI = r.ORG_URI AND sf.cohort_month = r.cohort_month
 LEFT JOIN cs_term_final ctf
     ON ctf.ORG_URI = r.ORG_URI AND ctf.cohort_month = r.cohort_month
+LEFT JOIN WORKSPACE.digitalda_stage.Entity_Sentiment_Features_C7 s
+    ON s.ORG_URI = r.ORG_URI AND s.cohort_month = r.cohort_month
 ORDER BY r.ORG_URI, r.cohort_month;
