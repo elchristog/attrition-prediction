@@ -21,20 +21,19 @@ anchor_records AS (
     FROM PREP.MDM_RELTIO.f_entity_wxaccountnumber_organization_snapshot
     QUALIFY ROW_NUMBER() OVER (
         PARTITION BY account_uri 
-        ORDER BY 
+        ORDER BY
             -- Priority 1: Was active exactly on March 1, 2026
-            CASE WHEN row_eff_begin_dttm <= '2026-03-01'::DATE AND (row_eff_end_dttm IS NULL OR row_eff_end_dttm > '2026-03-01'::DATE) THEN 1 
-            -- Priority 2: Started after March 1, 2026 (get the earliest one)
-                 WHEN row_eff_begin_dttm > '2026-03-01'::DATE THEN 2
+            CASE WHEN row_eff_begin_dttm <= '2026-03-01'::DATE AND (row_eff_end_dttm IS NULL OR row_eff_end_dttm > '2026-03-01'::DATE) THEN 1
+            -- Priority 2: Started after March 1, 2026 (get the earliesr one)
+            WHEN row_eff_begin_dttm > '2026-03-01'::DATE THEN 2
             -- Priority 3: Ended before March 1, 2026 (get the latest one)
-                 ELSE 3 END,
-            CASE WHEN row_eff_begin_dttm > '2026-03-01'::DATE THEN row_eff_begin_dttm END ASC,
-            row_eff_begin_dttm DESC
+            ELSE 3 END,
+        CASE WHEN row_eff_begin_dttm > '2026-03-01'::DATE THEN row_eff_begin_dttm END ASC,
+        row_eff_end_dttm DESC
     ) = 1
 ),
-
 historical_bridge AS (
-    -- Standard SCD2 Condition for reliable periods (On or after March 2026)
+    -- Standard SCD2 Condition for reliable periods (On or after March 1, 2026)
     SELECT
         c.cohort_month,
         snap.account_uri,
@@ -47,8 +46,8 @@ historical_bridge AS (
 
     UNION ALL
 
-    -- Retroactive patch for dates BEFORE March 2026
-    SELECT
+    -- Retroactive patch for accounts that started before March 1, 2026
+    SELECT 
         c.cohort_month,
         a.account_uri,
         a.org_uri
@@ -127,7 +126,8 @@ entity_monthly_snapshot AS (
         SUM(TOTAL_EXPOSURE_MTH)   AS ent_exposure,
         
         -- Count of active accounts
-        SUM(is_active_month)      AS active_account_count
+        SUM(is_active_month)      AS active_account_count,
+        SUM(outstanding_cardcount_mth) AS ent_fleet_cards
 
     FROM entity_account_base
     GROUP BY 1, 2

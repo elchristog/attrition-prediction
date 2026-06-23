@@ -54,6 +54,7 @@ def run_pipeline_sql(session, sql_dir="model_pipeline/sql"):
         "c1_target_variable.sql",
         "c2_account_features.sql",
         "c3_entity_features.sql",
+        "c7_sentiment_features.sql",
         "c4_target_table.sql",
         "c5_model_features.sql"
     ]

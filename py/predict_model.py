@@ -26,6 +26,158 @@ from feature_engineering import AttritionFeatureEngineer
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# TreeSHAP Reason Codes
+# ---------------------------------------------------------------------------
+
+# ── Journey Decision Tree (Crawl → Walk → Run) ──────────────────────────────
+# Implements the Tier × Cluster matrix agreed with Danielle Dane / Brad Siedler.
+# IS_RAPID_ESCALATION=1 overrides all tiers → immediate reactive treatment.
+# Key: (risk_tier, primary_attrition_category)
+JOURNEY_MATRIX = {
+    # ── Tier 1 — Top 15% combined score ─────────────────────────────────────
+    (1, "Fee Related"):              ("T1-FEE",   "HIGH_PRIORITY_CALL",  "Senior outreach + fee waiver or AutoPay migration offer"),
+    (1, "Declines at Pump"):         ("T1-PUMP",  "HIGH_PRIORITY_CALL",  "Proactive fleet control support call — resolve card block before customer seeks alternative"),
+    (1, "Customer Service"):         ("T1-CS",    "HIGH_PRIORITY_CALL",  "Account executive rescue call — prior CRM case or escalating CS friction"),
+    (1, "Fuel Volume / Purchasing"): ("T1-USAGE", "EMAIL_PLUS_SURVEY",   "Value reinforcement campaign + satisfaction survey to diagnose root cause"),
+    # ── Tier 2 — Next 20% ────────────────────────────────────────────────────
+    (2, "Fee Related"):              ("T2-FEE",   "AUTOMATED_EMAIL",     "Automated fee waiver offer or AutoPay migration nudge"),
+    (2, "Declines at Pump"):         ("T2-PUMP",  "AUTOMATED_EMAIL",     "Fleet controls training email — self-service fix for card declines"),
+    (2, "Customer Service"):         ("T2-CS",    "PERSONALIZED_EMAIL",  "Personalized service recovery email from account team"),
+    (2, "Fuel Volume / Purchasing"): ("T2-USAGE", "EMAIL_PLUS_SURVEY",   "Value positioning email + survey"),
+    # ── Tier 3 — Bottom 65% ──────────────────────────────────────────────────
+    (3, "Fee Related"):              ("T3-FEE",   "PASSIVE_CONTENT",     "Billing tips and AutoPay awareness content"),
+    (3, "Declines at Pump"):         ("T3-PUMP",  "PASSIVE_CONTENT",     "Self-service FAQ for fleet card controls"),
+    (3, "Customer Service"):         ("T3-CS",    "PASSIVE_CONTENT",     "Satisfaction check-in email"),
+    (3, "Fuel Volume / Purchasing"): ("T3-USAGE", "PASSIVE_CONTENT",     "Generic WEX value reinforcement"),
+}
+JOURNEY_RAPID_ESCALATION = ("RAPID-ESCALATION", "IMMEDIATE_ACTION", "Score increased ≥5pp — VAS team alert + CRM priority flag")
+
+
+def _assign_journey(row):
+    """Map a single prediction row to a journey ID, channel and treatment."""
+    if row.get("IS_RAPID_ESCALATION", 0) == 1:
+        jid, channel, treatment = JOURNEY_RAPID_ESCALATION
+    else:
+        key = (int(row.get("RISK_TIER", 3)), row.get("PRIMARY_ATTRITION_CATEGORY", "Fuel Volume / Purchasing"))
+        jid, channel, treatment = JOURNEY_MATRIX.get(key, ("T3-USAGE", "PASSIVE_CONTENT", "Generic WEX value reinforcement"))
+    return pd.Series({"JOURNEY_ID": jid, "JOURNEY_CHANNEL": channel, "JOURNEY_TREATMENT": treatment})
+
+
+# Content strategy clusters defined with the marketing team.
+# Every feature must belong to exactly one cluster.
+# When adding new features, assign them here before using them in the model.
+REASON_CODE_CATEGORY = {
+    # ── Declining Usage (Green) ─────────────────────────────────────────────
+    "SPEND_L3M_VS_BLENDED_RATIO":    "Fuel Volume / Purchasing",
+    "ENT_GALLONS_VELOCITY_3V12":     "Fuel Volume / Purchasing",
+    "ENT_GALLONS_VELOCITY_YOY":      "Fuel Volume / Purchasing",
+    "ACTIVE_MONTHS_RATE_L12M":       "Fuel Volume / Purchasing",
+    "ENT_GALLONS_AVG_3M":            "Fuel Volume / Purchasing",
+    "CURRENT_VOLUME_VS_PEAK_PCT":    "Fuel Volume / Purchasing",
+    "HISTORICAL_MAX_DROP_PCT":       "Fuel Volume / Purchasing",
+    "ACCOUNT_COUNT":                 "Account Profile",
+    "IS_TRUCKING_INDUSTRY":          "Account Profile",
+    "IS_SMALL_BIZ":                  "Account Profile",
+    # ── Declines at Pump (Red) ──────────────────────────────────────────────
+    "DECLINED_TXN_RATE_L6M":         "Declines at Pump",
+    "DECLINED_TXN_RATE_MTH":         "Declines at Pump",
+    # ── Fee Related (Blue) ──────────────────────────────────────────────────
+    "FEE_TO_REVENUE_RATIO_MTH":      "Fee Related",
+    "FEE_TO_REVENUE_RATIO_MTH_LAG1": "Fee Related",
+    "ENT_FEES_LAG1":                 "Fee Related",
+    "FEE_RATIO_TREND_3M":            "Fee Related",
+    # ── Customer Service (Orange) ───────────────────────────────────────────
+    "ENT_CASE_TOTAL_LAG2":               "Customer Service",
+    "ENT_CASE_TREND_3M":                 "Customer Service",
+    "ENT_CASE_PER_1K_GALLONS":           "Customer Service",
+    "MONTHS_SINCE_CS_TERMINATION_CASE":  "Customer Service",
+    "COUNT_TOTAL_CALLS_30D":             "Customer Service",
+    "COUNT_POOR_SENTIMENT_CALLS_30D":    "Customer Service",
+    "AVG_SENTIMENT_SCORE_90D":           "Customer Service",
+    "SENTIMENT_DELTA_VARIANCE":          "Customer Service",
+    "HAS_CONTACTED_30D":                 "Customer Service",
+}
+
+ATTRITION_REASON_LABELS = {
+    "SPEND_L3M_VS_BLENDED_RATIO":    "Declining Spend vs. Historical Baseline",
+    "DECLINED_TXN_RATE_L6M":         "High Declined Transaction Rate at Pump",
+    "ACTIVE_MONTHS_RATE_L12M":       "Reduced Fleet Activity (Past 12 Months)",
+    "FEE_TO_REVENUE_RATIO_MTH":      "High Fee-to-Revenue Burden (Current Month)",
+    "FEE_TO_REVENUE_RATIO_MTH_LAG1": "Elevated Fee-to-Revenue Burden (Prior Month)",
+    "ENT_GALLONS_VELOCITY_3V12":     "Declining Fuel Volume Trend",
+    "ENT_GALLONS_VELOCITY_YOY":      "Fuel Volume Declining Year-over-Year",
+    "IS_TRUCKING_INDUSTRY":          "Trucking Industry Risk Profile",
+    "ACCOUNT_COUNT":                 "Account Portfolio Concentration",
+    "ENT_CASE_TOTAL_LAG2":           "Elevated Customer Service Interactions",
+    "ENT_FEES_LAG1":                 "Recent Late or Service Fees Applied",
+    "IS_SMALL_BIZ":                  "Small Business Vulnerability",
+    "HISTORICAL_MAX_DROP_PCT":       "History of Sharp Volume Drops",
+    "ENT_GALLONS_AVG_3M":            "Below-Average Fuel Consumption (3-Month Avg)",
+    "ENT_CASE_TREND_3M":             "Escalating Customer Service Activity",
+    "ENT_CASE_PER_1K_GALLONS":       "High CS Contact Rate Relative to Fuel Volume",
+    "FEE_RATIO_TREND_3M":            "Fee Burden Increasing Over Time",
+    "CURRENT_VOLUME_VS_PEAK_PCT":    "Volume Well Below Historical Peak",
+    "DECLINED_TXN_RATE_MTH":         "Real-time Fuel Card Declined Spike",
+    "MONTHS_SINCE_CS_TERMINATION_CASE": "Recent Customer Service Attrition Case",
+    "COUNT_TOTAL_CALLS_30D":          "High Support Call Volume (30 Days)",
+    "COUNT_POOR_SENTIMENT_CALLS_30D": "Recent Support Interactions with Poor Customer Sentiment",
+    "AVG_SENTIMENT_SCORE_90D":        "Low Rolling Customer Sentiment Score (90 Days)",
+    "SENTIMENT_DELTA_VARIANCE":       "Recent Decline in Customer Sentiment Trend",
+    "HAS_CONTACTED_30D":              "Recent Support Center Contact",
+}
+
+
+def _compute_shap_reason_codes(model, X_features, prefix, top_n=3):
+    """
+    Compute TreeSHAP values for a LightGBM model and return the top-N attrition
+    drivers per entity as human-readable reason-code columns.
+
+    Positive SHAP values push the prediction toward attrition (class 1).
+    Features are ranked by descending SHAP value so the most influential driver
+    of risk appears first.
+
+    Returns a DataFrame aligned to X_features.index with columns:
+      {prefix}_REASON_1 .. {prefix}_REASON_{top_n}
+      {prefix}_REASON_1_SHAP .. {prefix}_REASON_{top_n}_SHAP
+    """
+    try:
+        import shap as _shap
+    except ImportError:
+        logger.warning("shap package not installed – reason codes unavailable. Run: pip install shap")
+        n = len(X_features)
+        cols = {}
+        for i in range(1, top_n + 1):
+            cols[f"{prefix}_REASON_{i}"] = [None] * n
+            cols[f"{prefix}_REASON_{i}_SHAP"] = [None] * n
+        return pd.DataFrame(cols, index=X_features.index)
+
+    logger.info(f"Running TreeSHAP for {prefix} model on {len(X_features)} entities...")
+    explainer = _shap.TreeExplainer(model)
+    shap_values = explainer.shap_values(X_features)
+
+    # LightGBM binary classifier: may return list [cls0_array, cls1_array] or a single 2-D array
+    sv = shap_values[1] if isinstance(shap_values, list) else shap_values
+
+    feature_names = X_features.columns.tolist()
+    shap_df = pd.DataFrame(sv, columns=feature_names, index=X_features.index)
+
+    out = {f"{prefix}_REASON_{i}": [] for i in range(1, top_n + 1)}
+    out.update({f"{prefix}_REASON_{i}_SHAP": [] for i in range(1, top_n + 1)})
+    out.update({f"{prefix}_REASON_{i}_CATEGORY": [] for i in range(1, top_n + 1)})
+
+    for idx in shap_df.index:
+        top_feats = shap_df.loc[idx].sort_values(ascending=False).head(top_n)
+        for i, (feat, val) in enumerate(top_feats.items(), 1):
+            label = ATTRITION_REASON_LABELS.get(feat, feat.replace("_", " ").title())
+            category = REASON_CODE_CATEGORY.get(feat, "Fuel Volume / Purchasing")
+            out[f"{prefix}_REASON_{i}"].append(label)
+            out[f"{prefix}_REASON_{i}_SHAP"].append(round(float(val), 5))
+            out[f"{prefix}_REASON_{i}_CATEGORY"].append(category)
+
+    return pd.DataFrame(out, index=shap_df.index)
+
+
 def predict_latest_snapshot(horizon="8M", min_gallons=100.0):
     """
     End-to-end inference script that pulls the most recent snapshot logic 
@@ -134,7 +286,7 @@ def predict_latest_snapshot(horizon="8M", min_gallons=100.0):
     logger.info(f"Downloading {row_count} rows for the snapshot {latest_cohort} into Pandas...")
     
     if row_count == 0:
-        logger.error(f"🛑 ABORTING: No valid entities ('Healthy', active accounts) found for the snapshot of {latest_cohort}.")
+        logger.error(f"ðŸ›‘ ABORTING: No valid entities ('Healthy', active accounts) found for the snapshot of {latest_cohort}.")
         logger.error("This usually happens if the data for this month has not yet been fully processed in Snowflake or if the filtering is too strict.")
         raise ValueError(f"The dataset is empty for date {latest_cohort} after applying filters. Aborting inference.")
     
@@ -151,7 +303,7 @@ def predict_latest_snapshot(horizon="8M", min_gallons=100.0):
         
     # session.close() # Moved to the end of the pipeline to allow writing results back to Snowflake
 
-    # Load Program Tier mapping from local TSV (PROGRAM_ID → Tier)
+    # Load Program Tier mapping from local TSV (PROGRAM_ID â†’ Tier)
     # Use __file__ so the path resolves correctly regardless of the working directory
     tier_map = {}
     _script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -176,7 +328,15 @@ def predict_latest_snapshot(horizon="8M", min_gallons=100.0):
     logger.info("Scoring probability predictions for HARD and SILENT models...")
     y_proba_hard = model_hard.predict_proba(X_pred_hard)[:, 1]
     y_proba_silent = model_silent.predict_proba(X_pred_silent)[:, 1]
-    
+
+    # 4b. Compute TreeSHAP reason codes for both models
+    logger.info("Computing TreeSHAP reason codes for HARD and SILENT models...")
+    shap_hard_df = _compute_shap_reason_codes(model_hard, X_pred_hard, prefix="HARD", top_n=4)
+    shap_silent_df = _compute_shap_reason_codes(model_silent, X_pred_silent, prefix="SILENT", top_n=4)
+    # Reindex to df's canonical index to handle any row-set differences between feature engineers
+    shap_hard_df = shap_hard_df.reindex(df.index)
+    shap_silent_df = shap_silent_df.reindex(df.index)
+
     # 5. Assemble final predictions output
     # Include total accounts and active/healthy accounts in the final csv
     cols_to_keep = ['ORG_URI', 'COHORT_MONTH']
@@ -184,6 +344,8 @@ def predict_latest_snapshot(horizon="8M", min_gallons=100.0):
         cols_to_keep.append('ACCOUNT_COUNT')
     if 'STATUS_ACTIVE_COUNT' in df.columns:
         cols_to_keep.append('STATUS_ACTIVE_COUNT')
+    if 'FLEET_SEGMENT' in df.columns:
+        cols_to_keep.append('FLEET_SEGMENT')
         
     # Enrich account objects (from C3's ARRAY_AGG(OBJECT_CONSTRUCT)) with today's risk eligibility
     if 'ACCOUNT_ID_LIST' in df.columns:
@@ -200,7 +362,7 @@ def predict_latest_snapshot(horizon="8M", min_gallons=100.0):
                 if isinstance(item, dict):
                     raw_pid = item.get('program_id')
                     # Strip surrounding quotes and whitespace Snowflake sometimes injects
-                    # e.g. '"1-1CA1YIW"' → '1-1CA1YIW'
+                    # e.g. '"1-1CA1YIW"' â†’ '1-1CA1YIW'
                     clean_pid = str(raw_pid).strip().strip('"').strip("'") if raw_pid is not None else None
                     result.append({
                         'account_id': str(item.get('account_id', '')),
@@ -364,6 +526,9 @@ def predict_latest_snapshot(horizon="8M", min_gallons=100.0):
         
     output_df = df[cols_to_keep].copy()
 
+    # Attach TreeSHAP reason code columns (aligned to df.index)
+    output_df = pd.concat([output_df, shap_hard_df, shap_silent_df], axis=1)
+
     # Fallback to zero if columns were not created (e.g. if ACCOUNT_ID_LIST is missing)
     if 'TOTAL_GALLONS_LAST_MONTH' not in output_df.columns:
         output_df['TOTAL_GALLONS_LAST_MONTH'] = 0.0
@@ -396,6 +561,49 @@ def predict_latest_snapshot(horizon="8M", min_gallons=100.0):
         labels=[3, 2, 1]
     ).astype(int)
 
+    # Dominant attrition type: compare percentile ranks within each model's own distribution,
+    # not raw probabilities. HARD attrition is much rarer than SILENT, so calibrated HARD
+    # probabilities are always numerically lower — comparing raw scores would almost always
+    # declare SILENT dominant even for accounts with extreme HARD risk.
+    hard_pct  = output_df[f'PREDICTION_SCORE_HARD_{horizon}'].rank(pct=True)
+    silent_pct = output_df[f'PREDICTION_SCORE_SILENT_{horizon}'].rank(pct=True)
+    output_df['HARD_SCORE_PERCENTILE']   = (hard_pct * 100).round(1)
+    output_df['SILENT_SCORE_PERCENTILE'] = (silent_pct * 100).round(1)
+    output_df['DOMINANT_ATTRITION_TYPE'] = (hard_pct >= silent_pct).map({True: 'HARD', False: 'SILENT'})
+    output_df['PRIMARY_ATTRITION_REASON'] = output_df.apply(
+        lambda r: r['HARD_REASON_1'] if r['DOMINANT_ATTRITION_TYPE'] == 'HARD' else r['SILENT_REASON_1'],
+        axis=1,
+    )
+    output_df['SECONDARY_ATTRITION_REASON'] = output_df.apply(
+        lambda r: r['HARD_REASON_2'] if r['DOMINANT_ATTRITION_TYPE'] == 'HARD' else r['SILENT_REASON_2'],
+        axis=1,
+    )
+    output_df['TERTIARY_ATTRITION_REASON'] = output_df.apply(
+        lambda r: r['HARD_REASON_3'] if r['DOMINANT_ATTRITION_TYPE'] == 'HARD' else r['SILENT_REASON_3'],
+        axis=1,
+    )
+    output_df['QUATERNARY_ATTRITION_REASON'] = output_df.apply(
+        lambda r: r['HARD_REASON_4'] if r['DOMINANT_ATTRITION_TYPE'] == 'HARD' else r['SILENT_REASON_4'],
+        axis=1,
+    )
+    # Content strategy clusters for the primary, secondary, tertiary, and quaternary drivers
+    output_df['PRIMARY_ATTRITION_CATEGORY'] = output_df.apply(
+        lambda r: r['HARD_REASON_1_CATEGORY'] if r['DOMINANT_ATTRITION_TYPE'] == 'HARD' else r['SILENT_REASON_1_CATEGORY'],
+        axis=1,
+    )
+    output_df['SECONDARY_ATTRITION_CATEGORY'] = output_df.apply(
+        lambda r: r['HARD_REASON_2_CATEGORY'] if r['DOMINANT_ATTRITION_TYPE'] == 'HARD' else r['SILENT_REASON_2_CATEGORY'],
+        axis=1,
+    )
+    output_df['TERTIARY_ATTRITION_CATEGORY'] = output_df.apply(
+        lambda r: r['HARD_REASON_3_CATEGORY'] if r['DOMINANT_ATTRITION_TYPE'] == 'HARD' else r['SILENT_REASON_3_CATEGORY'],
+        axis=1,
+    )
+    output_df['QUATERNARY_ATTRITION_CATEGORY'] = output_df.apply(
+        lambda r: r['HARD_REASON_4_CATEGORY'] if r['DOMINANT_ATTRITION_TYPE'] == 'HARD' else r['SILENT_REASON_4_CATEGORY'],
+        axis=1,
+    )
+
     # Calculate expected value metrics for additional context/visibility
     output_df['EXPECTED_GALLONS_AT_RISK'] = (
         output_df[f'PREDICTION_SCORE_COMBINED_{horizon}'] * 
@@ -405,6 +613,42 @@ def predict_latest_snapshot(horizon="8M", min_gallons=100.0):
         output_df[f'PREDICTION_SCORE_COMBINED_{horizon}'] * 
         output_df['TOTAL_SPEND_LAST_MONTH']
     )
+
+    # ── Score Delta: how much has risk changed since the previous run? ────────
+    # Needed for the journey decision tree: "rapid escalation" accounts get
+    # high-priority reactive treatment regardless of their absolute tier.
+    SCORE_COL = f'PREDICTION_SCORE_COMBINED_{horizon}'
+    ESCALATION_THRESHOLD = 0.05   # ≥5pp absolute increase → rapid escalation flag
+    try:
+        prev_table = "WORKSPACE.digitalda_stage.ATTRITION_STAKEHOLDER_PREDICTIONS"
+        prev_df = session.sql(f"""
+            SELECT ORG_URI, {SCORE_COL} AS PREV_SCORE
+            FROM {prev_table}
+            WHERE COHORT_MONTH = (
+                SELECT MAX(COHORT_MONTH) FROM {prev_table}
+                WHERE COHORT_MONTH < (SELECT MAX(COHORT_MONTH) FROM {prev_table})
+            )
+        """).to_pandas()
+        prev_df.columns = [c.upper() for c in prev_df.columns]
+        output_df = output_df.merge(prev_df, on='ORG_URI', how='left')
+        output_df['SCORE_DELTA'] = (
+            output_df[SCORE_COL] - output_df['PREV_SCORE']
+        ).round(4)
+        output_df['IS_RAPID_ESCALATION'] = (
+            output_df['SCORE_DELTA'] >= ESCALATION_THRESHOLD
+        ).astype(int)
+        output_df.drop(columns=['PREV_SCORE'], inplace=True)
+        escalations = output_df['IS_RAPID_ESCALATION'].sum()
+        logger.info(f"Score delta computed. {escalations} rapid escalations (delta ≥ {ESCALATION_THRESHOLD})")
+    except Exception as e:
+        logger.warning(f"Could not compute score delta (first run or missing history): {e}")
+        output_df['SCORE_DELTA'] = None
+        output_df['IS_RAPID_ESCALATION'] = 0
+
+    # ── Journey routing: Tier × Cluster → JOURNEY_ID / CHANNEL / TREATMENT ──
+    logger.info("Assigning journey routing (Tier × Cluster decision tree)...")
+    journey_cols = output_df.apply(_assign_journey, axis=1)
+    output_df = pd.concat([output_df, journey_cols], axis=1)
 
     # Sort sequentially by RISK_TIER (ascending), TOTAL_GALLONS_LAST_MONTH (descending), and combined score (descending)
     output_df = output_df.sort_values(
@@ -424,7 +668,7 @@ def predict_latest_snapshot(horizon="8M", min_gallons=100.0):
     output_df.to_csv(out_path, index=False)
     logger.info(f"Saved {len(output_df)} predictions (full) to: {out_path}")
 
-    # Stakeholder file — exclude orgs that have at least one ineligible account
+    # Stakeholder file â€” exclude orgs that have at least one ineligible account
     if 'HAS_INELIGIBLE_ACCOUNT' in output_df.columns:
         stakeholder_df = output_df[output_df['HAS_INELIGIBLE_ACCOUNT'] == False].copy()
     else:
@@ -465,6 +709,76 @@ def predict_latest_snapshot(horizon="8M", min_gallons=100.0):
         f"Saved {len(stakeholder_df)} predictions (stakeholders, {excluded} orgs excluded) to: {stakeholder_path}"
     )
 
+    # Generate segment risk matrices
+    matrix_path = os.path.join(output_data_dir, f"segment_risk_matrices_{horizon}.csv")
+    logger.info(f"Generating segment risk matrices at: {matrix_path}")
+    
+    categories = ["Fuel Volume / Purchasing", "Fee Related", "Declines at Pump", "Customer Service"]
+    observed_cats = set(categories)
+    if 'PRIMARY_ATTRITION_CATEGORY' in stakeholder_df.columns:
+        observed_cats.update(stakeholder_df['PRIMARY_ATTRITION_CATEGORY'].dropna().unique())
+    if 'SECONDARY_ATTRITION_CATEGORY' in stakeholder_df.columns:
+        observed_cats.update(stakeholder_df['SECONDARY_ATTRITION_CATEGORY'].dropna().unique())
+        
+    all_cats = sorted(list(observed_cats), key=lambda x: categories.index(x) if x in categories else 99)
+    columns_multi = pd.MultiIndex.from_product(
+        [all_cats, all_cats],
+        names=['PRIMARY_CATEGORY', 'SECONDARY_CATEGORY']
+    )
+    
+    segments = {
+        "Micro": "Micro & Small",
+        "Mid Market": "Mid Market",
+        "Enterprise": "Enterprise"
+    }
+    
+    try:
+        with open(matrix_path, 'w') as f:
+            for seg_name, label in segments.items():
+                logger.info(f"Processing segment: {seg_name} ({label})")
+                f.write(f"=== FLEET SEGMENT: {seg_name} ({label}) ===\n")
+                
+                try:
+                    if 'FLEET_SEGMENT' in stakeholder_df.columns:
+                        # Case-insensitive substring match to be robust to NaNs and different naming conventions
+                        if seg_name == "Micro":
+                            mask = stakeholder_df['FLEET_SEGMENT'].str.lower().str.contains('micro|small', na=False)
+                        elif seg_name == "Mid Market":
+                            mask = stakeholder_df['FLEET_SEGMENT'].str.lower().str.contains('mid', na=False)
+                        elif seg_name == "Enterprise":
+                            mask = stakeholder_df['FLEET_SEGMENT'].str.lower().str.contains('enterprise', na=False)
+                        else:
+                            mask = pd.Series(False, index=stakeholder_df.index)
+                        seg_df = stakeholder_df[mask]
+                    else:
+                        logger.warning(f"'FLEET_SEGMENT' column not found in stakeholder_df. Columns are: {list(stakeholder_df.columns)}")
+                        seg_df = pd.DataFrame()
+                        
+                    logger.info(f"Segment '{seg_name}' has {len(seg_df)} matching rows")
+                    
+                    if len(seg_df) > 0 and 'RISK_TIER' in seg_df.columns and 'PRIMARY_ATTRITION_CATEGORY' in seg_df.columns and 'SECONDARY_ATTRITION_CATEGORY' in seg_df.columns:
+                        ct = pd.crosstab(
+                            index=seg_df['RISK_TIER'],
+                            columns=[seg_df['PRIMARY_ATTRITION_CATEGORY'], seg_df['SECONDARY_ATTRITION_CATEGORY']],
+                            dropna=False
+                        )
+                        ct = ct.reindex(index=[1, 2, 3], columns=columns_multi, fill_value=0)
+                    else:
+                        logger.info(f"Creating empty matrix for {seg_name} (rows={len(seg_df)})")
+                        ct = pd.DataFrame(0, index=[1, 2, 3], columns=columns_multi)
+                    
+                    csv_str = ct.to_csv()
+                    f.write(csv_str)
+                    f.write("\n\n")
+                    logger.info(f"Successfully wrote matrix for segment: {seg_name}")
+                except Exception as seg_err:
+                    logger.error(f"Error generating matrix for segment {seg_name}: {seg_err}")
+                    f.write(f"ERROR: Failed to generate matrix for {seg_name}: {seg_err}\n\n")
+                    
+        logger.info(f"Saved segment risk matrices successfully to: {matrix_path}")
+    except Exception as e:
+        logger.error(f"Failed to open/write to segment risk matrices file: {e}")
+
     # 6. Export Stakeholders Table to Snowflake
     target_table = "WORKSPACE.digitalda_stage.ATTRITION_STAKEHOLDER_PREDICTIONS"
     logger.info(f"Exporting stakeholder predictions to Snowflake table: {target_table}...")
@@ -479,7 +793,7 @@ def predict_latest_snapshot(horizon="8M", min_gallons=100.0):
         logger.error(f"Failed to export stakeholder predictions to Snowflake: {e}")
 
     session.close()
-    logger.info(f"Pipeline execution complete. ✅")
+    logger.info(f"Pipeline execution complete. âœ…")
 
 if __name__ == "__main__":
     import argparse

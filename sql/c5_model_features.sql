@@ -48,7 +48,14 @@ rolling AS (
         SUM(CASE WHEN entity_active_mth = 1 THEN 1 ELSE 0 END) OVER (PARTITION BY org_uri ORDER BY cohort_month ROWS BETWEEN 5 PRECEDING AND CURRENT ROW) AS active_months_l6m,
         SUM(CASE WHEN entity_active_mth = 1 THEN 1 ELSE 0 END) OVER (PARTITION BY org_uri ORDER BY cohort_month ROWS BETWEEN 11 PRECEDING AND CURRENT ROW) AS active_months_l12m,
         LAG(account_count, 6) OVER (PARTITION BY org_uri ORDER BY cohort_month) AS account_count_6m_ago,
-        AVG(account_count) OVER (PARTITION BY org_uri ORDER BY cohort_month ROWS BETWEEN 5 PRECEDING AND CURRENT ROW) AS avg_account_count_l6m
+        AVG(account_count) OVER (PARTITION BY org_uri ORDER BY cohort_month ROWS BETWEEN 5 PRECEDING AND CURRENT ROW) AS avg_account_count_l6m,
+        -- New features: CS case trend & normalization
+        AVG(ent_case_total) OVER (PARTITION BY org_uri ORDER BY cohort_month ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS ent_case_total_avg_3m,
+        AVG(ent_case_total) OVER (PARTITION BY org_uri ORDER BY cohort_month ROWS BETWEEN 5 PRECEDING AND CURRENT ROW) AS ent_case_total_avg_6m,
+        -- New feature: fee ratio direction (baseline = avg from 3–5 months ago)
+        AVG(ent_fees / NULLIF(ent_revenue, 0)) OVER (PARTITION BY org_uri ORDER BY cohort_month ROWS BETWEEN 5 PRECEDING AND 3 PRECEDING) AS fee_ratio_avg_3_5m,
+        -- New feature: historical peak gallons (for current-vs-peak ratio)
+        MAX(ent_gallons) OVER (PARTITION BY org_uri ORDER BY cohort_month ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS ent_gallons_hist_peak
     FROM base_active
 ),
 
@@ -160,8 +167,7 @@ SELECT
     (r.ENT_DECLINED_TXNS_SUM_6M / NULLIF(r.ENT_TXNS_SUM_6M + r.ENT_DECLINED_TXNS_SUM_6M, 0)) AS DECLINED_TXN_RATE_L6M,
     (r.ENT_REVENUE / NULLIF(r.ENT_GALLONS, 0)) AS REVENUE_PER_GALLON_MTH,
     (r.ENT_FEES / NULLIF(r.ENT_REVENUE, 0)) AS FEE_TO_REVENUE_RATIO_MTH,
-    LAG(r.ENT_FEES / NULLIF(r.ENT_REVENUE, 0), 1) OVER (PARTITION BY r.org_uri ORDER BY r.cohort_month) AS FEE_TO_REVENUE_RATIO_MTH_LAG1,
-    LAG(r.ENT_FEES / NULLIF(r.ENT_REVENUE, 0), 4) OVER (PARTITION BY r.org_uri ORDER BY r.cohort_month) AS FEE_TO_REVENUE_RATIO_MTH_LAG4,
+    LAG(r.ENT_FEES / NULLIF(r.ENT_REVENUE, 0), 1) OVER (PARTITION BY r.ORG_URI ORDER BY r.cohort_month) AS FEE_TO_REVENUE_RATIO_MTH_LAG1,
     NULL AS LATE_FEE_TO_TOTAL_FEE_RATIO,
     NULL AS SR_RESOLUTION_RATE_MTH,
     NULL AS SR_RESOLUTION_RATE_L6M,
@@ -196,6 +202,7 @@ SELECT
     NULL AS SEASONALITY_SPEND_RATIO,
     NULL AS FEE_WAIVER_FREQUENCY_L12M,
     r.ent_gallons_velocity_3v12 AS ENT_GALLONS_VELOCITY_3V12,
+    r.ent_gallons_velocity_yoy AS ENT_GALLONS_VELOCITY_YOY,
     r.is_trucking_industry AS IS_TRUCKING_INDUSTRY,
     r.ACCOUNT_COUNT AS ACCOUNT_COUNT,
     r.ENT_CASE_TOTAL_LAG2 AS ENT_CASE_TOTAL_LAG2,
@@ -203,7 +210,30 @@ SELECT
     r.ENT_FEES_LAG4 AS ENT_FEES_LAG4,
     r.is_small_biz AS IS_SMALL_BIZ,
     r.historical_max_drop_pct AS HISTORICAL_MAX_DROP_PCT,
-    r.ent_gallons_avg_3m AS ENT_GALLONS_AVG_3M
+    r.ent_gallons_avg_3m AS ENT_GALLONS_AVG_3M,
+
+    -- ── NEW FEATURES (Gap analysis: enterprise CS intensity, fee trend, volume vs. peak) ──
+    -- CS case trend: recent (L3M avg) vs. older baseline (L6M avg). >1.0 = escalating.
+    (r.ent_case_total_avg_3m / NULLIF(r.ent_case_total_avg_6m, 0))     AS ENT_CASE_TREND_3M,
+    -- CS case intensity normalized by volume: cases per 1,000 gallons (3M avg baseline).
+    (r.ent_case_total / NULLIF(r.ent_gallons_avg_3m, 0) * 1000)        AS ENT_CASE_PER_1K_GALLONS,
+    -- Fee ratio direction: current month ratio minus the 3–5 month-ago baseline.
+    -- Positive = fee burden growing; captures deterioration before it crosses a hard threshold.
+    ((r.ENT_FEES / NULLIF(r.ENT_REVENUE, 0)) - r.fee_ratio_avg_3_5m)  AS FEE_RATIO_TREND_3M,
+    -- Current volume as a fraction of the entity's all-time historical peak gallons.
+    -- <1.0 means the entity has not recovered to peak; <0.75 signals meaningful decline.
+    (r.ent_gallons_avg_3m / NULLIF(r.ent_gallons_hist_peak, 0))        AS CURRENT_VOLUME_VS_PEAK_PCT,
+    CASE 
+        WHEN COALESCE(r.ent_fleet_cards, 0) BETWEEN 1 AND 9 THEN 'Micro & Small'
+        WHEN COALESCE(r.ent_fleet_cards, 0) BETWEEN 10 AND 250 THEN 'Mid Market'
+        WHEN COALESCE(r.ent_fleet_cards, 0) > 250 THEN 'Enterprise'
+        ELSE 'Unknown'
+    END AS FLEET_SEGMENT,
+    s.COUNT_TOTAL_CALLS_30D AS COUNT_TOTAL_CALLS_30D,
+    s.COUNT_POOR_SENTIMENT_CALLS_30D AS COUNT_POOR_SENTIMENT_CALLS_30D,
+    s.AVG_SENTIMENT_SCORE_90D AS AVG_SENTIMENT_SCORE_90D,
+    s.SENTIMENT_DELTA_VARIANCE AS SENTIMENT_DELTA_VARIANCE,
+    s.HAS_CONTACTED_30D AS HAS_CONTACTED_30D
 FROM rolling r
 LEFT JOIN entity_history eh
     ON eh.ORG_URI = r.ORG_URI AND eh.cohort_month = r.cohort_month
@@ -213,4 +243,6 @@ LEFT JOIN streak_final sf
     ON sf.ORG_URI = r.ORG_URI AND sf.cohort_month = r.cohort_month
 LEFT JOIN cs_term_final ctf
     ON ctf.ORG_URI = r.ORG_URI AND ctf.cohort_month = r.cohort_month
+LEFT JOIN WORKSPACE.digitalda_stage.Entity_Sentiment_Features_C7 s
+    ON s.ORG_URI = r.ORG_URI AND s.cohort_month = r.cohort_month
 ORDER BY r.ORG_URI, r.cohort_month;

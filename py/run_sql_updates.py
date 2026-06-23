@@ -16,7 +16,7 @@ def run_sql_file(session, file_path):
             session.sql(stmt).collect()
     print(f"Successfully executed {file_path}")
 
-if __name__ == '__main__':
+if __name__ == 'main':
     try:
         session = get_snowpark_session()
         
@@ -30,6 +30,9 @@ if __name__ == '__main__':
         # Run C3
         run_sql_file(session, os.path.join(sql_dir, 'c3_entity_features.sql'))
         
+        # Run C7 (Entity Sentiment Features)
+        run_sql_file(session, os.path.join(sql_dir, 'c7_sentiment_features.sql'))
+        
         # Run C4 (regenerate master table with new features)
         run_sql_file(session, os.path.join(sql_dir, 'c4_target_table.sql'))
 
@@ -40,4 +43,3 @@ if __name__ == '__main__':
         print("Pipeline updated successfully.")
     except Exception as e:
         print(f"ERROR: {str(e)}")
-

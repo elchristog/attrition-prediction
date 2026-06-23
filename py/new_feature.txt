@@ -1,0 +1,120 @@
+quiero agregar una nueva feature predictiva para entrenar los modelos y es el sentiment score, he trabajado en un query que genera esa data pero debe incorporarse aca con mucho cuidado, primero deberia ser un pipeline independiente, segundod eberia mantener buenas practicas de modularidad y de pipelines asi que antes de todo analiza muy bien los pipelines de c1...c6 de sql y los de python. tambien deberias ver que estamos usando panel data y cohortes por lo tanto esta data deberia ser una tabla a la que el pipeline llame para traer la info de la cohorte respectiva, siguiente, esta data esta a nivel cuenta pero nuestro modelo a nivel entidad, asi que deberian crearse agregaciones inteligentes que detecten attrition pero a nivel entidad agregando la info de las cuentas que edicha entidad tiene y generando features del sentiment score inteligentes como SENTIMENT_DELTA_VARIANCE entity level, AVG_SENTIMENT_SCORE_90D entity level y demas que se te ocurran, de hehco quiero que me propongas las mejores, The goal of this data engineering initiative was to locate, validate, and operationalize a reliable Customer Sentiment Score within the Snowflake Data Warehouse to serve as a predictive behavioral feature for the Fleet Churn Model V2.Through extensive telemetry auditing and cross-functional exploration, we successfully reconciled two distinct data architecture eras (PREP and COMMON schemas). This unified pipeline unlocks an uninterrupted timeline spanning from 2024 through June 2026, capturing clean, human-agent interactions tied directly to North American Fleet (NAM) accounts.2. Infrastructure & Ingestion Mapping ContextUpstream operational alignment with Kyle Bolduc (Contact Center Operations SME) clarified the structural flow of our contact center logs and engineering boundaries:Upstream Ingestion Layer (Genesys): The raw Genesys conversation logs and conversational transcripts are currently routed into an AWS S3 bucket via the Genesys A3S data service. Direct analytics access in Snowflake is blocked due to strict corporate compliance and privacy guidelines.Downstream Production Loop (Salesforce Cloud): Processed interaction metrics are pushed from Genesys into native Salesforce Service Cloud tables, which then sync down to Snowflake via the COMMON.CALLCENTER layer.WexHealth Exclusion: WexHealth data runs on an entirely isolated Salesforce instance and an independent HiTrust Snowflake schema. It is completely excluded from this business intelligence pipeline.3. Analytical Discoveries & Architectural ErasOur telemetry analysis revealed that the voice call dataset is divided into two distinct engineering eras, each requiring a specific connection bridge to resolve account metadata:Era 1: Historical Baseline (Pre-November 2025)Table: PREP.SALESFORCE_OWNER.VOICECALLCharacteristics: Direct account ID mappings were mostly missing or broken. However, records contained a persistent Salesforce Case lookup reference (CASE__C).The Bridge: Joining this table against COMMON.CALLCENTER.SALESFORCE_CASE_DETAILS via the Case ID field successfully mapped calls to active 13-digit NAM account numbers (LIKE '91%').Era 2: Active Production Schema (November 2025 – Present/2026)Table: COMMON.CALLCENTER.SALESFORCE_VOICECALLCharacteristics: The telemetry sync shifted to this refined production object. It completely lacks a direct case column, storing instead a native Salesforce Account ID string (VOICECALL_ACCOUNT_ID).The Bridge: Joining this table directly to the Case Master table via v.VOICECALL_ACCOUNT_ID = c.ACCOUNT_ID allows us to extract the clean NAM account strings for all of 2026.Queue Filter: Filtering explicitly by VOICECALL_QUEUE_NAME LIKE '%NAF%' isolates the North American Fleet business unit, removing call traffic from other lines of business.4. Data Safeguards & Deduplication RulesTo protect the Machine Learning model from telemetry noise, system bugs, and data inflation, the following structural safeguards were designed and integrated natively into the SQL extraction query:Enforcing Genuine Human Interaction: Short drops, abandoned calls, and pure IVR automated greeting metrics are filtered out by enforcing a strict call duration threshold of at least 60 seconds (CALLDURATIONINSECONDS >= 60). Validation showed our filtered dataset maintains a highly interactive average call duration of 5.80 minutes.Junction Table Deduplication: Because a single Salesforce Account ID can have multiple open or historical cases within SALESFORCE_CASE_DETAILS, an standard join causes rows to multiply. Implementing an explicit SELECT DISTINCT modifier inside the production CTE successfully restricts each interaction to a single unique row.Handling Long-Tail System Loops: Portions of the raw history show technical outliers where a single account generates up to 858 automated routing records in a single month with static neutral scores. These system re-tries represent infrastructural noise, not human risk behavior. The data science DataFrame pipeline will clip these outliers at a threshold of $\le 30$ calls per month during the python feature-scaling phase.5. Definitive Production SQL QueryThis query unifies the historical data chunk from PREP and the real-time active data from COMMON, ensures consistent duration measurements, eliminates case-based duplication, and outputs clean 13-digit account strings ready for aggregation.SQL-- ====================================================================
+-- UNIFIED MASTER VOICE CALL HISTORY PIPELINE (2024 - 2026) - PRODUCTION FINAL
+-- Target: Risk Data Science Fleet Churn Model V2 (Deduplicated Layer)
+-- ====================================================================
+
+WITH historical_prep_calls AS (
+    -- 1. LAYER 1: Historical Data Segment (Pre-November 2025) via Direct Case Bridge
+    SELECT 
+        v.ID AS voice_call_id,
+        DATE_TRUNC('MONTH', v.CALLSTARTDATETIME) AS target_month,
+        v.CALLSTARTDATETIME AS call_start_time_utc,
+        v.CALLDURATIONINSECONDS AS call_duration_seconds,
+        TRY_TO_NUMBER(v.CUSTOMER_SENTIMENT__C) AS customer_sentiment_score,
+        c.ACCOUNT_WEX_ACCOUNT AS nam_account_number,
+        'PREP_TABLE_HISTORICAL' AS data_source_origin
+    FROM PREP.SALESFORCE_OWNER.VOICECALL v
+    INNER JOIN COMMON.CALLCENTER.SALESFORCE_CASE_DETAILS c 
+        ON v.CASE__C = c.CASE_ID
+    WHERE v.CUSTOMER_SENTIMENT__C IS NOT NULL 
+      AND c.ACCOUNT_WEX_ACCOUNT LIKE '91%'   
+      AND LENGTH(c.ACCOUNT_WEX_ACCOUNT) = 13
+      AND v.CALLDURATIONINSECONDS >= 60
+      AND v.CALLSTARTDATETIME < '2025-11-01' -- Transitional boundary condition
+),
+
+production_common_calls AS (
+    -- 2. LAYER 2: Production Data Segment (Post-November 2025) Deduplicated Account-to-Case mapping
+    SELECT DISTINCT -- DISTINCT eliminates multiple rows caused by one account having multiple cases
+        v.VOICECALL_ID AS voice_call_id,
+        DATE_TRUNC('MONTH', v.VOICECALL_CREATED_DATE_UTC) AS target_month,
+        v.VOICECALL_START_TIME_UTC AS call_start_time_utc,
+        DATEDIFF(second, v.VOICECALL_START_TIME_UTC, v.VOICECALL_END_TIME_UTC) AS call_duration_seconds,
+        TRY_TO_NUMBER(v.VOICECALL_CUSTOMER_SENTIMENT_SCORE) AS customer_sentiment_score,
+        c.ACCOUNT_WEX_ACCOUNT AS nam_account_number, 
+        'COMMON_TABLE_PRODUCTION' AS data_source_origin
+    FROM COMMON.CALLCENTER.SALESFORCE_VOICECALL v
+    INNER JOIN COMMON.CALLCENTER.SALESFORCE_CASE_DETAILS c 
+        ON v.VOICECALL_ACCOUNT_ID = c.ACCOUNT_ID 
+    WHERE v.VOICECALL_CUSTOMER_SENTIMENT_SCORE IS NOT NULL
+      AND v.VOICECALL_QUEUE_NAME LIKE '%NAF%' -- Targets North American Fleet Business Unit queues
+      AND v.VOICECALL_CREATED_DATE_UTC >= '2025-11-01' -- Transitional boundary condition
+      AND DATEDIFF(second, v.VOICECALL_START_TIME_UTC, v.VOICECALL_END_TIME_UTC) >= 60
+      AND c.ACCOUNT_WEX_ACCOUNT LIKE '91%'   
+      AND LENGTH(c.ACCOUNT_WEX_ACCOUNT) = 13
+),
+
+unified_master_history AS (
+    -- 3. LAYER 3: Combined Clean History Core
+    SELECT * FROM historical_prep_calls
+    UNION ALL
+    SELECT * FROM production_common_calls
+)
+
+-- ====================================================================
+-- FINAL EXTRACTION LAYER WITH PREDICTIVE FEATURE TIERS
+-- ====================================================================
+SELECT 
+    voice_call_id,
+    target_month,
+    call_start_time_utc,
+    call_duration_seconds,
+    customer_sentiment_score,
+    nam_account_number,
+    data_source_origin,
+    -- Statistical boundaries calculated via historical continuous percentiles
+    CASE 
+        WHEN customer_sentiment_score <= -10 THEN 'High Risk / Poor'
+        WHEN customer_sentiment_score > -10 AND customer_sentiment_score <= 20 THEN 'Neutral-Low'
+        WHEN customer_sentiment_score > 20 AND customer_sentiment_score <= 50 THEN 'Neutral-High'
+        ELSE 'Excellent / Good'
+    END AS customer_sentiment_tier
+FROM unified_master_history
+ORDER BY call_start_time_utc DESC;
+6. Statistical Threshold MatrixA statistical distribution and percentile profile ran across our target population mapped the absolute mathematical boundaries for satisfaction. These cuts are natively embedded into the pipeline logic:Score Metric RangeModel Feature TierBehavioral Significance$-100$ to $-10$🔴 High Risk / PoorBottom 25% of all client calls. Captures operational distress, acute billing friction, or high churn danger.$-10$ to $20$🟡 Neutral-LowSecond quartile metrics. Indicates minor account dissatisfaction, sitting below the median line.$20$ to $50$🟢 Neutral-HighStandard post-call baseline. Danielle Dane confirmed a score of 20 acts as the operational threshold for acceptable closure status.$50$ to $100$🔵 Excellent / GoodTop 25% of support calls. Represents total issue resolution and stable customer health.7. Model V2 Feature Store Implementation StrategyUsing this unified pipeline dataset, the training script will compute rolling historical features over sliding time frames (30, 60, and 90 days) grouped by nam_account_number:COUNT_TOTAL_CALLS_30D: Monthly frequency count tracking overall support interaction velocity.COUNT_POOR_SENTIMENT_CALLS_30D: Count of calls where the tier evaluated to High Risk / Poor ($\le -10$). This serves as a vital trigger for systemic customer frustration.AVG_SENTIMENT_SCORE_90D: A 90-day rolling average to establish the customer's historical satisfaction baseline.SENTIMENT_DELTA_VARIANCE: Calculated as the mathematical difference between the account’s 15-day average sentiment and its 90-day baseline. A sharp negative drop indicates an escalating customer crisis, serving as a primary predictive risk feature for the attrition model. Estás tocando uno de los problemas más comunes y críticos al construir un Feature Store para modelos de riesgo o atrición (churn).Si dejas que la base de datos o tu script de Python (Pandas/PySpark) maneje esto a ciegas, las cuentas que no han tenido llamadas van a quedar con valores nulos (NaN o None) o ceros mal interpretados, lo que efectivamente sesgará y arruinará las predicciones de tu modelo de Machine Learning.Aquí te explico exactamente por qué ocurre este riesgo y los tres controles obligatorios que debes aplicar para solucionarlo:1. El Riesgo: El falso sesgo del Cero y del NuloCuando calculas variables agregadas (como promedios o deltas), el nulo y el cero significan cosas destructivas para algoritmos como XGBoost, LightGBM o Regresiones Logísticas si no se controlan:El peligro en los Conteos (COUNT): Si una empresa no llamó en 30 días, su COUNT_TOTAL_CALLS_30D debe ser 0. Aquí el cero es correcto y lógico.El peligro mortal en los Promedios (AVG): Si una empresa no ha llamado en 90 días, su AVG_SENTIMENT_SCORE_90D va a dar NULL (Nulo). Si imputas ese nulo con un 0, el modelo va a pensar que el cliente tiene un sentimiento de 0 (lo cual, según tus percentiles, es un score Neutral-Low, tirando a malo). ¡Estarías inventando que el cliente está insatisfecho cuando en realidad simplemente no ha necesitado llamar!El peligro en los Deltas (DELTA): Si calculas la diferencia entre los últimos 15 días vs los 90 días anteriores, y en ambos periodos no hay llamadas, el resultado matemático es un nulo.2. Control 1: El Cruce contra el "Spine" (Universo Total de Cuentas)Para que tu modelo no se sesgue, el query de tus variables predictivas (features) no puede nacer de la tabla de llamadas. Tiene que nacer de tu Maestro de Cuentas Activas (ACCOUNT) y hacer un LEFT JOIN hacia tu query maestro de llamadas.Esto garantiza que las empresas que no llamaron sigan existiendo en tu dataset de entrenamiento con sus filas correspondientes, pero con métricas vacías que controlaremos en el siguiente paso.3. Control 2: Imputación Lógica de Variables (Feature Infill)En tu script de preparación de datos (en Python/SQL), debes aplicar reglas estrictas de imputación dependiendo del tipo de variable:A. Para los Conteos (Frecuencias) $\rightarrow$ Forzar a 0Cualquier nulo en conteos se transforma en un cero absoluto mediante un COALESCE en SQL o un .fillna(0) en Pandas. No haber llamado es un comportamiento neutral-bueno.B. Para los Promedios de Sentimiento $\rightarrow$ Imputación con el "Score Neutral Teórico"Si un cliente no ha llamado, su score de satisfacción no es cero. Su score debe ser imputado con la Mediana Neutral del negocio (20). De este modo, el modelo entiende que el cliente está en un estado estándar/normal.C. Creación de un Flag de Actividad (¡Súper predictivo!)Crea una variable booleana llamada HAS_CONTACTED_30D (1 si llamó, 0 si no). Los modelos de árbol (como XGBoost) aman este control, ya que aíslan inmediatamente al grupo de cuentas "silenciosas".4. El Query definitivo con Control de Sesgo IntegradoPara dejar tu pipeline blindado y listo para el Feature Store, modificamos la capa final para que realice este control de nulos automáticamente en SQL.Aquí tienes cómo estructurar la consulta final de agregación por cuenta (ejemplo para una ventana de 30 y 90 días):SQL-- ====================================================================
+-- FEATURE STORE PIPELINE WITH NULL/ZERO BIAS CONTROLS
+-- Target: Aggregated Account-Level Risk Features for Model V2
+-- ====================================================================
+
+WITH master_calls_pipeline AS (
+    -- (Aquí va tu query unificado deductivo de la respuesta anterior)
+    SELECT voice_call_id, target_month, call_start_time_utc, customer_sentiment_score, nam_account_number, customer_sentiment_tier
+    FROM (
+        SELECT v.ID AS voice_call_id, DATE_TRUNC('MONTH', v.CALLSTARTDATETIME) AS target_month, v.CALLSTARTDATETIME AS call_start_time_utc, TRY_TO_NUMBER(v.CUSTOMER_SENTIMENT__C) AS customer_sentiment_score, c.ACCOUNT_WEX_ACCOUNT AS nam_account_number FROM PREP.SALESFORCE_OWNER.VOICECALL v INNER JOIN COMMON.CALLCENTER.SALESFORCE_CASE_DETAILS c ON v.CASE__C = c.CASE_ID WHERE v.CUSTOMER_SENTIMENT__C IS NOT NULL AND c.ACCOUNT_WEX_ACCOUNT LIKE '91%' AND LENGTH(c.ACCOUNT_WEX_ACCOUNT) = 13 AND v.CALLDURATIONINSECONDS >= 60 AND v.CALLSTARTDATETIME < '2025-11-01'
+        UNION ALL
+        SELECT DISTINCT v.VOICECALL_ID AS voice_call_id, DATE_TRUNC('MONTH', v.VOICECALL_CREATED_DATE_UTC) AS target_month, v.VOICECALL_START_TIME_UTC AS call_start_time_utc, TRY_TO_NUMBER(v.VOICECALL_CUSTOMER_SENTIMENT_SCORE) AS customer_sentiment_score, c.ACCOUNT_WEX_ACCOUNT AS nam_account_number FROM COMMON.CALLCENTER.SALESFORCE_VOICECALL v INNER JOIN COMMON.CALLCENTER.SALESFORCE_CASE_DETAILS c ON v.VOICECALL_ACCOUNT_ID = c.ACCOUNT_ID WHERE v.VOICECALL_CUSTOMER_SENTIMENT_SCORE IS NOT NULL AND v.VOICECALL_QUEUE_NAME LIKE '%NAF%' AND v.VOICECALL_CREATED_DATE_UTC >= '2025-11-01' AND DATEDIFF(second, v.VOICECALL_START_TIME_UTC, v.VOICECALL_END_TIME_UTC) >= 60 AND c.ACCOUNT_WEX_ACCOUNT LIKE '91%' AND LENGTH(c.ACCOUNT_WEX_ACCOUNT) = 13
+    )
+),
+
+nam_account_universe AS (
+    -- CONTROL 1: El Universo Base. Traemos TODAS las cuentas NAM activas del maestro
+    SELECT DISTINCT 
+        a.ACCOUNT_NUMBER__C AS nam_account_number
+    FROM PREP.SALESFORCE_OWNER.ACCOUNT a
+    WHERE a.ACCOUNT_NUMBER__C LIKE '91%' AND LENGTH(a.ACCOUNT_NUMBER__C) = 13
+)
+
+-- ====================================================================
+-- FINAL CONTROL LAYER: AGGREGATION & BIAS IMPUTATION
+-- ====================================================================
+SELECT 
+    u.nam_account_number,
+    
+    -- CONTROL 2A: Los conteos de llamadas si son nulos se fuerzan a 0
+    COALESCE(COUNT(CASE WHEN m.call_start_time_utc >= DATEADD(day, -30, CURRENT_TIMESTAMP()) THEN m.voice_call_id END), 0) AS count_total_calls_30d,
+    COALESCE(COUNT(CASE WHEN m.call_start_time_utc >= DATEADD(day, -30, CURRENT_TIMESTAMP()) AND m.customer_sentiment_score <= -10 THEN 1 END), 0) AS count_poor_sentiment_calls_30d,
+    
+    -- CONTROL 2B: El promedio si es nulo se imputa con la MEDIANA NEUTRAL (20.00) para evitar sesgar el modelo
+    COALESCE(ROUND(AVG(CASE WHEN m.call_start_time_utc >= DATEADD(day, -90, CURRENT_TIMESTAMP()) THEN m.customer_sentiment_score END), 2), 20.00) AS avg_sentiment_score_90d,
+    
+    -- CONTROL 2C: Flag de actividad booleano (0 = Cuenta silenciosa, 1 = Cuenta activa)
+    CASE 
+        WHEN COUNT(CASE WHEN m.call_start_time_utc >= DATEADD(day, -30, CURRENT_TIMESTAMP()) THEN m.voice_call_id END) > 0 THEN 1 
+        ELSE 0 
+    END AS has_contacted_30d
+
+FROM nam_account_universe u
+LEFT JOIN master_calls_pipeline m 
+    ON u.nam_account_number = m.nam_account_number
+GROUP BY u.nam_account_number;
+🎯 Beneficio de este enfoque:Con este query de control, si una cuenta de tu portafolio no ha llamado nunca o lleva meses sin interactuar, su registro para el modelo V2 se verá así:COUNT_TOTAL_CALLS_30D = 0COUNT_POOR_SENTIMENT_CALLS_30D = 0AVG_SENTIMENT_SCORE_90D = 20.00 (Neutral)HAS_CONTACTED_30D = 0 (Silenciosa)El modelo procesará estos datos sin ningún tipo de sesgo matemático, interpretando correctamente que la cuenta se encuentra en un estado pasivo y saludable

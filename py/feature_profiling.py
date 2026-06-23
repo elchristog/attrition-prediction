@@ -38,7 +38,10 @@ class MultiHorizonProfiler:
             'HISTORICAL_ZERO_GALLON_MONTHS', 'HISTORICAL_MAX_DROP_PCT',
             'SPEND_L3M_VS_BLENDED_RATIO', 'CONSECUTIVE_INACTIVE_MONTHS',
             'DECLINED_TXN_RATE_L6M', 'ACTIVE_MONTHS_RATE_L12M',
-            'FEE_TO_REVENUE_RATIO_MTH', 'LATE_FEE_TO_TOTAL_FEE_RATIO'
+            'FEE_TO_REVENUE_RATIO_MTH', 'LATE_FEE_TO_TOTAL_FEE_RATIO',
+            'COUNT_TOTAL_CALLS_30D', 'COUNT_POOR_SENTIMENT_CALLS_30D',
+            'AVG_SENTIMENT_SCORE_90D', 'SENTIMENT_DELTA_VARIANCE',
+            'HAS_CONTACTED_30D'
         ]
         
         # Approved Firmographics (Static/Profile)
@@ -151,9 +154,9 @@ class MultiHorizonProfiler:
 
         results = []
         for target in self.targets:
-            # Extract horizon (e.g. 8M) even if target is TARGET_HARD_8M or TARGET_SILENT_8M
             import re
-            match = re.search(r'(\d+M)', target)
+            # Extract horizon (e.g. 8M) even if target is TARGET_HARD_8M or TARGET_SILENT_8M
+            match = re.search(r'_(\d+M)', target)
             hz_suffix = match.group(1) if match else "8M"
             excl_flag = f"EXCL_FLAG_3_{hz_suffix}"
             

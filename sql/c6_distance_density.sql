@@ -192,18 +192,25 @@ SELECT
 FROM coarse_filter
 GROUP BY 1, 2;
 
+
 -- ============================================================================
 -- Step 8: Footprint Classification
 -- ============================================================================
 CREATE OR REPLACE TEMPORARY TABLE WORKSPACE.digitalda_stage.tmp_account_classification AS
 WITH base_parents AS (
-    SELECT accountnumber, H3_CELL_TO_PARENT(h3_heatmap_parent_res4, 3) AS res3_cell, H3_CELL_TO_PARENT(h3_heatmap_parent_res4, 2) AS res2_cell, total_transactions 
+    SELECT 
+        accountnumber, 
+        h3_heatmap_parent_res4, -- 🛠️ CORREGIDO: Faltaba agregar esta columna aquí para que no falle agg_res3 ni agg_res2
+        H3_CELL_TO_PARENT(h3_heatmap_parent_res4, 3) AS res3_cell, 
+        H3_CELL_TO_PARENT(h3_heatmap_parent_res4, 2) AS res2_cell, 
+        total_transactions 
     FROM WORKSPACE.digitalda_stage.tmp_account_heatmap
 ),
 agg_res4 AS (SELECT accountnumber, MAX(total_transactions) AS max_res4_txns FROM WORKSPACE.digitalda_stage.tmp_account_heatmap GROUP BY 1),
 agg_res3 AS (SELECT accountnumber, MAX(txns) AS max_res3_txns FROM (SELECT accountnumber, res3_cell, SUM(total_transactions) AS txns FROM base_parents GROUP BY 1, 2) GROUP BY 1),
 agg_res2 AS (SELECT accountnumber, MAX(txns) AS max_res2_txns FROM (SELECT accountnumber, res2_cell, SUM(total_transactions) AS txns FROM base_parents GROUP BY 1, 2) GROUP BY 1),
 account_totals AS (SELECT accountnumber, SUM(total_transactions) AS total_txns FROM base_parents GROUP BY 1)
+
 SELECT
     t.accountnumber,
     CASE
@@ -217,16 +224,24 @@ LEFT JOIN agg_res4 r4 ON t.accountnumber = r4.accountnumber
 LEFT JOIN agg_res3 r3 ON t.accountnumber = r3.accountnumber
 LEFT JOIN agg_res2 r2 ON t.accountnumber = r2.accountnumber;
 
+
 CREATE OR REPLACE TEMPORARY TABLE WORKSPACE.digitalda_stage.tmp_org_classification AS
 WITH org_base_parents AS (
-    SELECT ap.org_uri, h.h3_heatmap_parent_res4 AS res4_cell, H3_CELL_TO_PARENT(h.h3_heatmap_parent_res4, 3) AS res3_cell, H3_CELL_TO_PARENT(h.h3_heatmap_parent_res4, 2) AS res2_cell, h.total_transactions
+    SELECT 
+        ap.org_uri, 
+        h.h3_heatmap_parent_res4 AS res4_cell, 
+        H3_CELL_TO_PARENT(h.h3_heatmap_parent_res4, 3) AS res3_cell, 
+        H3_CELL_TO_PARENT(h.h3_heatmap_parent_res4, 2) AS res2_cell, 
+        h.total_transactions
     FROM WORKSPACE.digitalda_stage.tmp_account_heatmap h
     JOIN (SELECT DISTINCT accountnumber, org_uri FROM WORKSPACE.digitalda_stage.tmp_account_points) ap ON h.accountnumber = ap.accountnumber
 ),
-agg_res4 AS (SELECT org_uri, MAX(txns) AS max_res4_txns FROM (SELECT org_uri, h3_heatmap_parent_res4 AS res4_cell, SUM(total_transactions) AS txns FROM org_base_parents GROUP BY 1, 2) GROUP BY 1),
+-- 🛠️ CORREGIDO: Se cambió 'h3_heatmap_parent_res4 AS res4_cell' por 'res4_cell' a secas
+agg_res4 AS (SELECT org_uri, MAX(txns) AS max_res4_txns FROM (SELECT org_uri, res4_cell, SUM(total_transactions) AS txns FROM org_base_parents GROUP BY 1, 2) GROUP BY 1),
 agg_res3 AS (SELECT org_uri, MAX(txns) AS max_res3_txns FROM (SELECT org_uri, res3_cell, SUM(total_transactions) AS txns FROM org_base_parents GROUP BY 1, 2) GROUP BY 1),
 agg_res2 AS (SELECT org_uri, MAX(txns) AS max_res2_txns FROM (SELECT org_uri, res2_cell, SUM(total_transactions) AS txns FROM org_base_parents GROUP BY 1, 2) GROUP BY 1),
 org_totals AS (SELECT org_uri, SUM(total_transactions) AS total_txns FROM org_base_parents GROUP BY 1)
+
 SELECT
     t.org_uri,
     CASE
