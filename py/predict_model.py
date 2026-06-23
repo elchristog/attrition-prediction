@@ -330,12 +330,45 @@ def predict_latest_snapshot(horizon="8M", min_gallons=100.0):
         df['CONTACT_ACCOUNT_ID'] = df['SELECTION_RESULT'].apply(lambda x: x['account_id'])
         df['CONTACT_SELECTION_RULE'] = df['SELECTION_RESULT'].apply(lambda x: x['rule_code'])
 
-        cols_to_keep.append('ACCOUNT_DETAILS_LIST')
-        cols_to_keep.append('HAS_INELIGIBLE_ACCOUNT')
-        cols_to_keep.append('CONTACT_ACCOUNT_ID')
-        cols_to_keep.append('CONTACT_SELECTION_RULE')
+        # Calculate entity-level totals from account details list
+        import json as _json
+        def get_total_gallons(details_json):
+            try:
+                accounts = _json.loads(details_json) if isinstance(details_json, str) else details_json
+                if not accounts:
+                    return 0.0
+                return sum(float(acc.get('gallons_last_month', 0)) for acc in accounts)
+            except Exception:
+                return 0.0
+
+        def get_total_spend(details_json):
+            try:
+                accounts = _json.loads(details_json) if isinstance(details_json, str) else details_json
+                if not accounts:
+                    return 0.0
+                return sum(float(acc.get('spend_last_month', 0)) for acc in accounts)
+            except Exception:
+                return 0.0
+
+        df['TOTAL_GALLONS_LAST_MONTH'] = df['ACCOUNT_DETAILS_LIST'].apply(get_total_gallons)
+        df['TOTAL_SPEND_LAST_MONTH'] = df['ACCOUNT_DETAILS_LIST'].apply(get_total_spend)
+
+        cols_to_keep.extend([
+            'ACCOUNT_DETAILS_LIST',
+            'HAS_INELIGIBLE_ACCOUNT',
+            'CONTACT_ACCOUNT_ID',
+            'CONTACT_SELECTION_RULE',
+            'TOTAL_GALLONS_LAST_MONTH',
+            'TOTAL_SPEND_LAST_MONTH'
+        ])
         
     output_df = df[cols_to_keep].copy()
+
+    # Fallback to zero if columns were not created (e.g. if ACCOUNT_ID_LIST is missing)
+    if 'TOTAL_GALLONS_LAST_MONTH' not in output_df.columns:
+        output_df['TOTAL_GALLONS_LAST_MONTH'] = 0.0
+    if 'TOTAL_SPEND_LAST_MONTH' not in output_df.columns:
+        output_df['TOTAL_SPEND_LAST_MONTH'] = 0.0
     
     output_df[f'PREDICTION_SCORE_HARD_{horizon}'] = y_proba_hard
     output_df[f'PREDICTION_SCORE_SILENT_{horizon}'] = y_proba_silent
@@ -351,19 +384,36 @@ def predict_latest_snapshot(horizon="8M", min_gallons=100.0):
         output_df[f'PREDICTION_SCORE_SILENT_{horizon}']
     ).clip(upper=1.0)
 
-    # 2. Definitive Combined Rank: Based on the best rank from either model (Min-Rank)
-    # This ensures high-risk individuals in the 'Hard' segment are not buried by the larger 'Silent' segment
-    # We calculate a raw min-rank first, then break ties with the score to get a clean 1, 2, 3... sequence
-    output_df['PREDICTION_RANK_TMP'] = output_df[['PREDICTION_RANK_HARD', 'PREDICTION_RANK_SILENT']].min(axis=1)
-    
+    # 2. Definitive Combined Rank: Based on Risk Tiers and historical ROI (volume)
+    # Rank probabilities in percentile space (0.0 to 1.0, where 1.0 is highest risk in the current cohort)
+    risk_pct = output_df[f'PREDICTION_SCORE_COMBINED_{horizon}'].rank(pct=True)
+
+    # Segment into Risk Tiers: Tier 1 (High) = Top 15%, Tier 2 (Medium) = Next 20%, Tier 3 (Low) = Bottom 65%
+    # Note: Lower tier number = higher priority
+    output_df['RISK_TIER'] = pd.cut(
+        risk_pct,
+        bins=[-0.01, 0.65, 0.85, 1.01],
+        labels=[3, 2, 1]
+    ).astype(int)
+
+    # Calculate expected value metrics for additional context/visibility
+    output_df['EXPECTED_GALLONS_AT_RISK'] = (
+        output_df[f'PREDICTION_SCORE_COMBINED_{horizon}'] * 
+        output_df['TOTAL_GALLONS_LAST_MONTH']
+    )
+    output_df['EXPECTED_SPEND_AT_RISK'] = (
+        output_df[f'PREDICTION_SCORE_COMBINED_{horizon}'] * 
+        output_df['TOTAL_SPEND_LAST_MONTH']
+    )
+
+    # Sort sequentially by RISK_TIER (ascending), TOTAL_GALLONS_LAST_MONTH (descending), and combined score (descending)
     output_df = output_df.sort_values(
-        by=['PREDICTION_RANK_TMP', f'PREDICTION_SCORE_COMBINED_{horizon}'], 
-        ascending=[True, False]
+        by=['RISK_TIER', 'TOTAL_GALLONS_LAST_MONTH', f'PREDICTION_SCORE_COMBINED_{horizon}'], 
+        ascending=[True, False, False]
     )
     
     # Assign unique, sequential rank
     output_df['PREDICTION_RANK_COMBINED'] = range(1, len(output_df) + 1)
-    output_df.drop(columns=['PREDICTION_RANK_TMP'], inplace=True)
     
     # Save output to artifacts directory or SageMaker output directory
     output_data_dir = os.environ.get('SM_OUTPUT_DATA_DIR', 'attrition_pipeline/artifacts')
@@ -381,20 +431,9 @@ def predict_latest_snapshot(horizon="8M", min_gallons=100.0):
         stakeholder_df = output_df.copy()
 
     # Filter out entities that do not have total_gallons_last_month >= min_gallons
-    if 'ACCOUNT_DETAILS_LIST' in stakeholder_df.columns:
-        import json as _json
-        def has_enough_gallons(details_json):
-            try:
-                accounts = _json.loads(details_json) if isinstance(details_json, str) else details_json
-                if not accounts:
-                    return False
-                total_gallons = sum(float(acc.get('gallons_last_month', 0)) for acc in accounts)
-                return total_gallons >= min_gallons
-            except Exception:
-                return False
-        
+    if 'TOTAL_GALLONS_LAST_MONTH' in stakeholder_df.columns:
         before_gallons_filter = len(stakeholder_df)
-        stakeholder_df = stakeholder_df[stakeholder_df['ACCOUNT_DETAILS_LIST'].apply(has_enough_gallons)].copy()
+        stakeholder_df = stakeholder_df[stakeholder_df['TOTAL_GALLONS_LAST_MONTH'] >= min_gallons].copy()
         gallons_excluded = before_gallons_filter - len(stakeholder_df)
         logger.info(f"Excluded {gallons_excluded} orgs due to total gallons less than threshold of {min_gallons}")
     
